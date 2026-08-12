@@ -1,17 +1,26 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
-# claude-code-termux — 在 Termux (Android aarch64) 上一键安装官方 Claude Code CLI
-# 方案: 官方 glibc 二进制 + glibc-runner (grun) 转译, 纯脚本安装, 不发布 npm 包
+# claude-code-termux — Termux (Android aarch64) 一键安装/更新/卸载官方 Claude Code CLI
+# 纯脚本方案, 不发布 npm 分发包, 无需 glibc/grun
 #
 # 用法:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/claude-code-termux/main/install.sh)
 #   bash install.sh
 #   bash install.sh --uninstall
 #
 # 原理:
-#   Claude Code 官方只发布 glibc 版二进制 (@anthropic-ai/claude-code-linux-arm64),
-#   Android 上没有 glibc, 需经 Termux 的 glibc-runner (grun) 转译运行。
-#   官方 npm 包装的 bin 是 node 脚本且 shebang 是 /usr/bin/env (Termux 没有),
-#   直接用 grun 跑官方二进制即可, 不需要任何第三方分发包。
+#   官方 @anthropic-ai/claude-code-linux-arm64-musl 是 musl 动态链接二进制,
+#   用 patchelf 把 interpreter 改成 Termux 的 musl loader 即可直跑,
+#   与 opencode 同一套适配思路, 完全不需要 glibc-runner (grun)。
+#
+# 更新策略 (与官方机制差异):
+#   官方 Claude Code 是启动 CLI 之后在后台自动升级;
+#   本方案采用 codex-termux 同款: 启动前先查版本、有新版先升级再进程序,
+#   并在 wrapper 中设 DISABLE_AUTOUPDATER=1 关闭官方后台更新。
+#
+# DNS 复用 codex-termux 的成熟方案:
+#   有 root → dns53 本地转发器 (127.0.0.1:53, 自动跟随手机 DNS);
+#   无 root → dns-bootstrap 实测校验 + proot 绑定 resolv.conf。
 # ============================================================
 set -euo pipefail
 
@@ -20,9 +29,14 @@ PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 HOME_DIR="${HOME:-/data/data/com.termux/files/home}"
 CLAUDE_DIR="$HOME_DIR/.local/claude-code"
 CLAUDE_BIN="$CLAUDE_DIR/claude"
-WRAPPER_PATH="$HOME_DIR/.local/bin/claude"
 VERSION_FILE="$CLAUDE_DIR/.version"
+WRAPPER_PATH="$HOME_DIR/.local/bin/claude"
+NPM_PKG="@anthropic-ai/claude-code-linux-arm64-musl"
 CERT_FILE="$PREFIX/etc/tls/cert.pem"
+MUSL_LOADER="$PREFIX/lib/ld-musl-aarch64.so.1"
+RESOLV_CONF="$PREFIX/etc/resolv.conf"
+MUSL_APK_URL="https://dl-cdn.alpinelinux.org/alpine/edge/main/aarch64/musl-1.2.6-r2.apk"
+UPSTREAM_DOCS_URL="https://docs.anthropic.com/en/docs/claude-code"
 
 # ---------- 颜色 ----------
 RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[1;33m'; BLU='\033[1;36m'; NC='\033[0m'
@@ -41,158 +55,963 @@ check_environment() {
     info "环境检查通过 (Termux aarch64)"
 }
 
-# ---------- 依赖: nodejs + glibc-runner ----------
+# ---------- 镜像源适配 ----------
+fix_mirror() {
+    local sources_file="$PREFIX/etc/apt/sources.list"
+    [ -f "$sources_file" ] || { warn "未找到 apt 源文件, 跳过镜像适配"; return; }
+
+    local candidates=(
+        "packages.termux.dev"
+        "mirrors.aliyun.com/termux"
+        "mirrors.tuna.tsinghua.edu.cn/termux"
+        "mirrors.ustc.edu.cn/termux"
+        "mirrors.cloud.tencent.com/termux"
+        "mirrors.huaweicloud.com/termux"
+    )
+
+    local best="" best_t=99 c t1 t2 t
+    for c in "${candidates[@]}"; do
+        t1=$(curl -s -o /dev/null -w '%{time_total}' --connect-timeout 3 --max-time 8 \
+            "https://$c/apt/termux-main/dists/stable/Release" 2>/dev/null || echo 99)
+        t2=$(curl -s -o /dev/null -w '%{time_total}' --connect-timeout 3 --max-time 8 \
+            "https://$c/apt/termux-main/dists/stable/Release" 2>/dev/null || echo 99)
+        t=$(printf '%s\n%s\n' "$t1" "$t2" | sort -n | head -1)
+        info "测速 $c: ${t}s"
+        if awk "BEGIN{exit !($t < $best_t)}"; then
+            best="$c"; best_t="$t"
+        fi
+    done
+
+    if [ -z "$best" ]; then
+        warn "全部源测速失败, 保持当前配置 (可手动: pkg change-repo)"
+        return
+    fi
+    ok "最快源: $best (${best_t}s)"
+
+    if grep -q "$best" "$sources_file" 2>/dev/null; then
+        ok "当前源已是最快, 无需切换"
+        return
+    fi
+
+    warn "切换源: $(grep -oE 'https://[^/]+' "$sources_file" | head -1) → $best"
+    cp "$sources_file" "$sources_file.bak.$(date +%s)"
+    {
+        echo "# The termux-main repository contains the primary packages."
+        echo "deb https://$best/apt/termux-main stable main"
+    } > "$sources_file"
+    info "已切换 (原配置已备份: sources.list.bak.*)"
+
+    if apt update -y >/dev/null 2>&1; then
+        ok "apt update 成功 ($best)"
+    else
+        warn "apt update 失败, 请手动检查: pkg change-repo"
+    fi
+}
+
+# ---------- 全量升级 ----------
+upgrade_packages() {
+    info "更新软件包索引并升级全部软件包…"
+    if pkg upgrade -y >/dev/null 2>&1; then
+        ok "软件包已是最新"
+    else
+        warn "pkg upgrade 未完全成功, 请稍后重试 (pkg upgrade -y)"
+    fi
+}
+
+# ---------- musl loader ----------
+# 官方 musl 二进制动态链接 /lib/ld-musl-aarch64.so.1, Termux 没有, 从 Alpine 拉。
+# (opencode 方案同款; 已存在则跳过)
+install_musl_loader() {
+    [ -x "$MUSL_LOADER" ] && { ok "musl loader 已存在: $MUSL_LOADER"; return 0; }
+    info "下载 musl 动态链接器 (Alpine)…"
+    local tmp
+    tmp="$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/musl-loader.XXXXXX")"
+    trap 'rm -rf "$tmp"' RETURN
+    curl -fsSL --connect-timeout 15 --max-time 120 "$MUSL_APK_URL" -o "$tmp/musl.apk" \
+        || fail "musl apk 下载失败: $MUSL_APK_URL"
+    (cd "$tmp" && tar xzf musl.apk) || fail "musl apk 解压失败"
+    [ -f "$tmp/lib/ld-musl-aarch64.so.1" ] || fail "apk 中未找到 ld-musl-aarch64.so.1"
+    cp "$tmp/lib/ld-musl-aarch64.so.1" "$PREFIX/lib/"
+    chmod +x "$MUSL_LOADER"
+    ok "musl loader 已安装: $MUSL_LOADER"
+}
+
+# ---------- 依赖 ----------
+# 注意: 不再需要 glibc-repo / glibc-runner (grun), 只需要 nodejs(npm) + patchelf。
 install_dependencies() {
     local need=()
+    command -v curl >/dev/null || need+=(curl)
     command -v node >/dev/null || need+=(nodejs-lts)
     command -v npm >/dev/null || need+=(nodejs-lts)
-    command -v curl >/dev/null || need+=(curl)
+    command -v patchelf >/dev/null || need+=(patchelf)
+    if command -v sudo >/dev/null 2>&1; then
+        if ! sudo -n true 2>/dev/null; then
+            need+=(proot)
+        fi
+    else
+        need+=(sudo)
+    fi
     if [ ${#need[@]} -gt 0 ]; then
         info "安装依赖: ${need[*]}"
         pkg install -y "${need[@]}" || fail "依赖安装失败, 请先手动执行 pkg update && pkg upgrade"
     fi
-    # glibc-runner (grun) 从独立仓库装
-    if ! command -v grun >/dev/null 2>&1 && [ ! -x "$PREFIX/glibc/bin/grun" ]; then
-        info "安装 glibc-repo + glibc-runner (grun)…"
-        pkg install -y glibc-repo || true
-        pkg update -y
-        pkg install -y glibc-runner || fail "glibc-runner 安装失败"
+    # sudo 刚装完再验证一次; 仍无 root 则补 proot
+    if ! sudo -n true 2>/dev/null; then
+        command -v proot >/dev/null 2>&1 || { info "未检测到 root, 安装 proot 兜底…"; pkg install -y proot; }
+        warn "未检测到 root: 将使用 proot 兜底方案 (性能略降)"
     fi
-    if ! command -v grun >/dev/null 2>&1 && [ ! -x "$PREFIX/glibc/bin/grun" ]; then
-        fail "grun (glibc-runner) 未就绪, 请手动: pkg install glibc-repo && pkg update && pkg install glibc-runner"
-    fi
-    ok "依赖已就绪 (node $(node --version), grun)"
+    install_musl_loader
+    ok "依赖已就绪 (node $(node --version), patchelf)"
 }
 
-# ---------- glibc 侧 DNS ----------
-# glibc 程序经 grun 转译后读 /usr/glibc/etc/resolv.conf (Android 无 /etc/resolv.conf)。
-# 写入国内公共 DNS; 有 root 且装了 dns53 时由 127.0.0.1:53 兜底。
+# ---------- 证书 ----------
+fix_cert() {
+    if [ ! -f "$CERT_FILE" ]; then
+        warn "未找到 CA 证书 ($CERT_FILE), 尝试安装 ca-certificates…"
+        pkg install -y ca-certificates
+    fi
+    ok "证书路径: $CERT_FILE"
+}
+
+# ---------- DNS 修复 ----------
+# musl 解析器读不到 /etc/resolv.conf (Android 没有), 回退 127.0.0.1:53
+# 而手机无人监听该端口 → 每次 API 请求卡满 5s 超时 (报错与 SSL 证书问题
+# 几乎相同: "error sending request for url")。方案:
+#   有 root → dns53 本地转发器 + .bashrc 常驻
+#   无 root → dns-bootstrap 实测校验 + proot 绑定 resolv.conf (wrapper 运行时自动选择)
 fix_dns() {
-    local glibc_resolv="$PREFIX/glibc/etc/resolv.conf"
-    mkdir -p "$(dirname "$glibc_resolv")"
-    if [ ! -s "$glibc_resolv" ] || ! grep -q 'nameserver' "$glibc_resolv" 2>/dev/null; then
-        printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 114.114.114.114\n' > "$glibc_resolv"
-        info "glibc resolv.conf 已写入国内 DNS: $glibc_resolv"
-    else
-        ok "glibc resolv.conf 已存在: $(grep nameserver "$glibc_resolv" | tr '\n' ' ')"
-    fi
+    local dns53="$HOME_DIR/.local/bin/dns53.js"
+    local dnsboot="$HOME_DIR/.local/bin/dns-bootstrap.js"
+    mkdir -p "$HOME_DIR/.local/bin"
+
+    if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true 2>/dev/null; then
+        info "未检测到 root, 使用 dns-bootstrap + proot 兜底"
+        info "dns-bootstrap 会自动实测候选 DNS 应答质量 (SERVFAIL/空/被过滤全判废), 只写入真实可用的 resolv.conf"
+        cat > "$dnsboot" << 'DNSBOOT_EOF'
+#!/usr/bin/env node
+// dns-bootstrap — 无 root 环境下的 DNS 自动校验器
+// 背景: musl 程序 (codex/opencode) 解析器读不到 /etc/resolv.conf (Android 没有)。
+//       有 root 时 dns53.js 监听 127.0.0.1:53 转发解析; 无 root 绑不了特权端口,
+//       只能让 musl 直接查 resolv.conf 里的公网 DNS。
+//       本脚本解决后者: 实际探测当前网络 → 逐个实测公网 DNS 应答质量
+//       (SERVFAIL/空应答/CNAME-only 全判废) → 只把"实测通过"的写进 resolv.conf,
+//       再交给 proot 绑定。网络被拦截时给出明确报错, 不再静默卡 5 秒。
+// 用法:
+//   node dns-bootstrap.js            # 单次校验并重写 resolv.conf (wrapper 启动前用)
+//   node dns-bootstrap.js --daemon   # 常驻: 每 60s 重测重写 (开机/打开终端时拉起)
+const dgram = require('dgram');
+const fs = require('fs');
+const path = require('path');
+const { execFileSync } = require('child_process');
+
+const PUBLIC_DNS = ['223.5.5.5', '119.29.29.29', '114.114.114.114'];
+// 测速用域名: 主测 API 域名; 若主域名本身被网络过滤, 回退测国内域名判断网络是否可用
+const PROBE_DOMAINS = ['api.deepseek.com', 'www.baidu.com'];
+const TIMEOUT_MS = 2500;
+const RESOLV = process.env.DNS_RESOLV_CONF ||
+  `${process.env.PREFIX || '/data/data/com.termux/files/usr'}/etc/resolv.conf`;
+const LOG = process.env.DNS_BOOTSTRAP_LOG ||
+  `${process.env.HOME || '/data/data/com.termux/files/home'}/.codex/dns-bootstrap.log`;
+const log = (m) => { try { fs.appendFileSync(LOG, `${new Date().toISOString()} ${m}\n`); } catch (_) {} };
+
+// 探测手机当前网络 DNS (与 dns53 同一套逻辑, 无 root 也能跑 dumpsys)
+function discoverPhoneDns() {
+  const servers = [];
+  try {
+    const props = execFileSync('/system/bin/getprop', [], { encoding: 'utf8', timeout: 3000 });
+    for (const line of props.split('\n')) {
+      const m = line.match(/^\[net\.\S+\.dns\d+\]:\s*\[([0-9.]+)\]/);
+      if (m) servers.push(m[1]);
+    }
+  } catch (_) {}
+  if (servers.length === 0) {
+    try {
+      const out = execFileSync('/system/bin/dumpsys', ['connectivity'], { encoding: 'utf8', timeout: 5000 });
+      const blocks = out.split('NetworkAgentInfo{').slice(1);
+      const scored = [];
+      for (const b of blocks) {
+        const dm = b.match(/DnsAddresses:\s*\[([^\]]*)\]/);
+        if (!dm) continue;
+        const ips = [];
+        let hit;
+        const re = /(\d{1,3}(?:\.\d{1,3}){3})/g;
+        while ((hit = re.exec(dm[1]))) ips.push(hit[1]);
+        if (!ips.length) continue;
+        const score = (b.includes('TRANSPORT_PRIMARY') ? 0 : 1) + (b.includes('INTERNET') && b.includes('VALIDATED') ? 0 : 2);
+        scored.push([score, ips]);
+      }
+      scored.sort((a, b) => a[0] - b[0]);
+      for (const [, ips] of scored) servers.push(...ips);
+    } catch (_) {}
+  }
+  return [...new Set(servers)].filter((ip) => ip !== '127.0.0.1' && ip !== '0.0.0.0');
 }
 
-# ---------- 安装官方 Claude Code 二进制 ----------
-install_claude() {
-    info "查询 @anthropic-ai/claude-code-linux-arm64 最新版本…"
-    local version
-    version=$(npm view @anthropic-ai/claude-code-linux-arm64 version) || fail "无法获取版本号"
-    info "最新版本: $version"
+// DNS 查询 (UDP 53, 非特权端口即可发起)
+function queryDNS(server, host, timeout = TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    const sock = dgram.createSocket('udp4');
+    const id = Buffer.from([Math.floor(Math.random() * 256), Math.floor(Math.random() * 256)]);
+    const q = Buffer.alloc(12 + 2 + host.length + 4);
+    id.copy(q, 0);
+    q[5] = 1; // RD
+    let off = 12;
+    for (const part of host.split('.')) { q[off++] = part.length; q.write(part, off); off += part.length; }
+    q[off++] = 0; q[off++] = 0; q[off++] = 1; q[off++] = 0; q[off++] = 1; // A IN
+    const t0 = Date.now();
+    const timer = setTimeout(() => { try { sock.close(); } catch (_) {} resolve({ ok: false, reason: 'timeout', ms: Date.now() - t0 }); }, timeout);
+    sock.on('message', (resp) => {
+      clearTimeout(timer);
+      resolve({ ok: !badAnswer(resp), ms: Date.now() - t0, raw: resp });
+      try { sock.close(); } catch (_) {}
+    });
+    sock.on('error', () => { clearTimeout(timer); try { sock.close(); } catch (_) {} resolve({ ok: false, reason: 'error', ms: Date.now() - t0 }); });
+    sock.send(q, 53, server);
+  });
+}
 
-    local installed=""
-    [ -f "$VERSION_FILE" ] && installed=$(cat "$VERSION_FILE" 2>/dev/null || true)
-    if [ -x "$CLAUDE_BIN" ] && [ "$installed" = "$version" ]; then
-        ok "已是最新版本 v$version, 跳过下载"
+// 应答校验: 返回 true = 应答有问题 (与 dns53 的 isBadResponse 同套标准)
+// 坏应答: 报文过短 / SERVFAIL / rcode=0 无答案 / 查 A 却只回 CNAME 不附地址 (ISP 过滤)
+function badAnswer(resp) {
+  if (resp.length < 12) return true;
+  const rcode = resp.readUInt16BE(2) & 0x0f;
+  if (rcode === 2) return true;
+  if (rcode !== 0 && rcode !== 3) return true; // 只放行 NOERROR / NXDOMAIN
+  const qd = resp.readUInt16BE(4);
+  const an = resp.readUInt16BE(6);
+  if (an === 0) return rcode === 0; // NOERROR 无答案 = 被过滤; NXDOMAIN 合法
+  let off = 12;
+  const skipName = (p) => {
+    let hops = 0;
+    while (off < p.length && p[off] !== 0) {
+      if ((p[off] & 0xc0) === 0xc0) { off += 2; return; }
+      off += p[off] + 1;
+      if (++hops > 32) break;
+    }
+    off++;
+  };
+  for (let i = 0; i < qd && off < resp.length; i++) { skipName(resp); off += 4; }
+  for (let i = 0; i < an && off + 10 <= resp.length; i++) {
+    skipName(resp);
+    const type = resp.readUInt16BE(off);
+    const len = resp.readUInt16BE(off + 8);
+    off += 10 + len;
+    if (type === 1 || type === 28) return false; // 有 A/AAAA 记录
+  }
+  return true; // 只有 CNAME/NS 等 → 过滤特征
+}
+
+// 对单个服务器实测: 主域名失败再试备域名, 任一通过即为可用
+async function probe(server) {
+  for (const host of PROBE_DOMAINS) {
+    const r = await queryDNS(server, host);
+    if (r.ok) return { ip: server, ms: r.ms, host, ok: true };
+  }
+  return { ip: server, ms: Infinity, ok: false };
+}
+
+async function runOnce() {
+  const phone = discoverPhoneDns();
+  const candidates = [...phone, ...PUBLIC_DNS];
+  const uniq = [];
+  for (const ip of candidates) if (!uniq.includes(ip)) uniq.push(ip);
+  if (uniq.length === 0) uniq.push(...PUBLIC_DNS);
+
+  const results = await Promise.all(uniq.map((ip) => probe(ip)));
+  const good = results.filter((r) => r.ok).sort((a, b) => a.ms - b.ms);
+
+  for (const r of results) {
+    log(`probe ${r.ip}: ${r.ok ? `OK ${r.ms}ms via ${r.host}` : 'FAILED'}`);
+  }
+
+  const comment = [];
+  if (phone.length) comment.push(`# phone dns: ${phone.join(', ')}`);
+  const top = good.slice(0, 3);
+  const body = top.length
+    ? top.map((r) => `nameserver ${r.ip}`).join('\n') + '\n'
+    : 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n';
+
+  fs.mkdirSync(path.dirname(RESOLV), { recursive: true });
+  fs.writeFileSync(RESOLV, `${comment.join('\n')}\n# auto-written by dns-bootstrap.js @ ${new Date().toISOString()}\n${body}`);
+  log(`resolv.conf updated: ${top.map((r) => r.ip).join(', ') || 'NONE (fallback public)'}`);
+
+  return good.length;
+}
+
+async function main() {
+  const daemon = process.argv.includes('--daemon');
+  const doOnce = async () => {
+    try {
+      const n = await runOnce();
+      if (n === 0) log('ALL upstreams failed — network DNS likely blocked');
+    } catch (e) {
+      log(`error: ${e.message}`);
+      process.exitCode = 1;
+    }
+  };
+  if (daemon) {
+    await doOnce();
+    log('daemon started (poll every 60s)');
+    setInterval(() => { doOnce(); }, 60000);
+  } else {
+    await doOnce();
+  }
+}
+
+main();
+DNSBOOT_EOF
+
+        chmod +x "$dnsboot"
+        info "dns-bootstrap.js 已写入: $dnsboot"
+
+        # 无 root 常驻: 每 60s 重测重写 resolv.conf, 网络切换自动跟随
+        if ! grep -q 'dns-bootstrap' "$HOME_DIR/.bashrc" 2>/dev/null; then
+            cat >> "$HOME_DIR/.bashrc" << 'DNSBOOT_RC_EOF'
+
+# ===== DNS 自动校验常驻 (dns-bootstrap, 无 root 方案) =====
+# 无 root 时由它实测候选公网 DNS 应答质量, 只把真实可用的写进 resolv.conf,
+# 交给 proot 绑定给 musl 读取。每 60s 重测, 切 WiFi/基站自动跟随。
+if ! pgrep -f "dns-bootstrap[.]js.*daemon" > /dev/null 2>&1; then
+    nohup node "$HOME/.local/bin/dns-bootstrap.js" --daemon >> "$HOME/.codex/dns-bootstrap.log" 2>&1 &
+    sleep 1
+fi
+DNSBOOT_RC_EOF
+            info "dns-bootstrap 常驻逻辑已写入 ~/.bashrc"
+        fi
+
+        # 立即实测一次并生成 resolv.conf (proot 绑定用)
+        node "$dnsboot" || warn "当前网络 DNS 全部不可用 (53 被拦截?), 已回退公共 DNS 写入 resolv.conf"
+        info "如需原生直跑方案, 请在 Magisk 中授权 Termux 后重跑本脚本"
         return
     fi
 
-    local tarball work
-    work=$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/claude-install.XXXXXX")
-    tarball="$work/claude.tgz"
-    # npm pack 走用户配置的 registry (国内通常 npmmirror, 快)
-    if ! (cd "$work" && npm pack "@anthropic-ai/claude-code-linux-arm64@${version}" --silent >/dev/null 2>&1); then
-        # 回退: 直接 curl 官方 registry
-        warn "npm pack 失败, 回退官方 registry 下载…"
-        curl -fsSL --connect-timeout 15 --max-time 300 \
-            "https://registry.npmjs.org/@anthropic-ai/claude-code-linux-arm64/-/claude-code-linux-arm64-${version}.tgz" \
-            -o "$tarball" || fail "下载失败 (v${version})"
+    ok "root 可用, 使用 dns53 原生方案"
+    # 每次重跑都覆盖为最新版 (含 DNS 自动探测)
+    cat > "$dns53" << 'DNS53_EOF'
+#!/usr/bin/env node
+// dns53 — 本地 DNS 转发器 (127.0.0.1:53)
+// 背景: musl 程序 (codex/opencode) 解析器读不到 /etc/resolv.conf (Android 没有),
+//       回退到默认 127.0.0.1:53, 而手机上没人监听该端口 → DNS 卡死 → 5s 超时。
+// 方案: 在 127.0.0.1:53 上监听 UDP, 优先转发到手机当前使用的 DNS (延迟更低),
+//       再依次回退到公共 DNS (阿里→腾讯→114), 回传响应。
+// 运行: sudo node dns53.js  (53 是特权端口)
+const dgram = require('dgram');
+const fs = require('fs');
+const { execFileSync } = require('child_process');
+
+// 公共兜底 DNS (手机 DNS 探测失败时使用)
+const PUBLIC_DNS = [
+  ['223.5.5.5', 53],      // 阿里
+  ['119.29.29.29', 53],   // 腾讯
+  ['114.114.114.114', 53],// 114
+];
+const TIMEOUT_MS = 1500;
+// 屏蔽 AAAA: Termux 环境下 IPv6 基本不可用 (电信 WLAN 常见 IPv6 黑洞:
+// 有地址但出站丢包), Go/musl 客户端拿到 AAAA 后优先尝试 IPv6 → 卡死超时。
+// 对 AAAA 返回"无记录", 客户端自动回落 IPv4。可用 DNS53_DISABLE_AAAA=0 关闭。
+const DISABLE_AAAA = process.env.DNS53_DISABLE_AAAA !== '0';
+// 固定路径: sudo 运行时 HOME 会变成 .suroot, 不能用 HOME 推导
+const LOG = process.env.DNS53_LOG || '/data/data/com.termux/files/home/.codex/dns53.log';
+const log = (m) => {
+  try {
+    fs.appendFileSync(LOG, `${new Date().toISOString()} ${m}\n`);
+  } catch (_) {}
+};
+// 日志轮转: 超过 2MB 截掉前半 (调试期高频查询日志会涨)
+function rotateLog() {
+  try {
+    const st = fs.statSync(LOG);
+    if (st.size > 2 * 1024 * 1024) {
+      const content = fs.readFileSync(LOG, 'utf8');
+      fs.writeFileSync(LOG, content.slice(Math.floor(content.length / 2)));
+      log('LOG ROTATED');
+    }
+  } catch (_) {}
+}
+setInterval(rotateLog, 60000);
+
+let UPSTREAMS = [...PUBLIC_DNS];
+
+// 探测手机当前 DNS (优先默认网络的 IPv4 地址)
+function discoverPhoneDns() {
+  const servers = [];
+  try {
+    // 老版本 Android: getprop net.*.dnsN
+    const props = execFileSync('/system/bin/getprop', [], { encoding: 'utf8', timeout: 3000 });
+    for (const line of props.split('\n')) {
+      const m = line.match(/^\[net\.\S+\.dns\d+\]:\s*\[([0-9.]+)\]/);
+      if (m) servers.push(m[1]);
+    }
+  } catch (_) {}
+  if (servers.length === 0) {
+    try {
+      // 现代 Android: dumpsys connectivity 的 DnsAddresses。
+      // 优先默认网络 (TRANSPORT_PRIMARY), 再收集所有 INTERNET+VALIDATED 网络,
+      // 避免个别机型/网络下主网络块 DnsAddresses 为空时拿不到 DNS。
+      const out = execFileSync('/system/bin/dumpsys', ['connectivity'], { encoding: 'utf8', timeout: 5000 });
+      const blocks = out.split('NetworkAgentInfo{').slice(1);
+      const scored = [];
+      for (const b of blocks) {
+        const dm = b.match(/DnsAddresses:\s*\[([^\]]*)\]/);
+        if (!dm) continue;
+        const re = /(\d{1,3}(?:\.\d{1,3}){3})/g;
+        const ips = [];
+        let hit;
+        while ((hit = re.exec(dm[1]))) ips.push(hit[1]);
+        if (!ips.length) continue;
+        const score = (b.includes('TRANSPORT_PRIMARY') ? 0 : 1) + (b.includes('INTERNET') && b.includes('VALIDATED') ? 0 : 2);
+        scored.push([score, ips]);
+      }
+      scored.sort((a, b) => a[0] - b[0]);
+      for (const [, ips] of scored) servers.push(...ips);
+    } catch (_) {}
+  }
+  return [...new Set(servers)].filter((ip) => ip !== '127.0.0.1' && ip !== '0.0.0.0');
+}
+
+// 刷新上游: 手机 DNS 在前, 公共 DNS 兜底 (每分钟一次, 网络切换后自动跟随)
+function refreshDns() {
+  const phone = discoverPhoneDns();
+  if (phone.length === 0) return;
+  const merged = [];
+  for (const ip of [...phone, ...PUBLIC_DNS.map((s) => s[0])]) {
+    if (!merged.some((s) => s[0] === ip)) merged.push([ip, 53]);
+  }
+  if (JSON.stringify(merged) !== JSON.stringify(UPSTREAMS)) {
+    UPSTREAMS = merged;
+    log(`dns servers: ${merged.map((s) => s[0]).join(', ')}`);
+  }
+}
+
+// 连续空应答计数: 记录各上游的连续"被过滤"次数, 达到阈值后降级到底部
+const strikes = new Map();
+const MAX_STRIKES = 3;
+
+// 判断应答是否有效: 返回 true = 应答异常, 应换下一个上游。
+// 覆盖: 报文过短 / SERVFAIL / A 查询 rcode=0 但答案为空 / A 查询只回 CNAME 没给 A
+//       (中国 ISP DNS 常见过滤手法: 剥离 CNAME 链末端的地址记录)。
+// 注意: AAAA 查询 (qtype=28) 一律放行 —— 域名没有 IPv6 记录时 NOERROR+0 答案、
+//       部分上游对 AAAA 返回 NOTIMP 都是正常现象, 应由客户端自行回退 A 记录。
+function isBadResponse(resp, qtype) {
+  if (resp.length < 12) return true;
+  const flags = resp.readUInt16BE(2);
+  const rcode = flags & 0x0f;
+  if (rcode === 2) return true; // SERVFAIL
+  if (qtype === 28) return false; // AAAA: 空/NOTIMP/CNAME-only 均合法, 不判坏
+  if (rcode !== 0 && rcode !== 3) return true; // NOTIMP/REFUSED 等 → 判坏换上游
+  const qd = resp.readUInt16BE(4);
+  const an = resp.readUInt16BE(6);
+  if (an === 0) return true; // A 查询 rcode=0 但无任何答案 = 被过滤
+  if (qtype !== 1) return false; // 非 A 查询, 只做基本校验
+  // 逐条解析答案区, 看是否含有 A 记录
+  let off = 12;
+  const skipName = (p) => {
+    let hops = 0;
+    while (off < p.length && p[off] !== 0) {
+      if ((p[off] & 0xc0) === 0xc0) { off += 2; return; }
+      off += p[off] + 1;
+      if (++hops > 32) break;
+    }
+    off++;
+  };
+  for (let i = 0; i < qd && off < resp.length; i++) { skipName(resp); off += 4; }
+  for (let i = 0; i < an && off + 10 <= resp.length; i++) {
+    skipName(resp);
+    const type = resp.readUInt16BE(off);
+    const len = resp.readUInt16BE(off + 8);
+    off += 10 + len;
+    if (type === 1) return false; // 找到 A 记录, 应答有效
+  }
+  return true; // A 查询答案区只有 CNAME/NS 等, 没有地址记录
+}
+
+// 降级: 把 host 移到列表末尾, 下次刷新会按新的手机 DNS 顺序重建
+function demote(host) {
+  const idx = UPSTREAMS.findIndex((s) => s[0] === host);
+  if (idx > 0) {
+    const [s] = UPSTREAMS.splice(idx, 1);
+    UPSTREAMS.push(s);
+    log(`demoted bad upstream ${host}`);
+  }
+}
+
+// 从查询报文解析 qtype (跳过问题名, 不受 EDNS 附加区影响)
+function queryType(msg) {
+  if (msg.length < 16) return 0;
+  let off = 12;
+  let hops = 0;
+  while (off < msg.length && msg[off] !== 0) {
+    if ((msg[off] & 0xc0) === 0xc0) return 0; // 压缩指针不出现于查询
+    off += msg[off] + 1;
+    if (++hops > 32) return 0;
+  }
+  if (off >= msg.length) return 0;
+  off++; // root label
+  if (off + 4 > msg.length) return 0;
+  return (msg[off] << 8) | msg[off + 1];
+}
+
+// 从查询报文解析域名 (与 queryType 共用同一套偏移, 保证一致性)
+function queryName(msg) {
+  if (msg.length < 12) return null;
+  let off = 12;
+  let name = '';
+  while (off < msg.length && msg[off] !== 0) {
+    const len = msg[off++];
+    if (off + len > msg.length) return null;
+    name += (name ? '.' : '') + msg.slice(off, off + len).toString();
+    off += len;
+  }
+  if (off >= msg.length) return null;
+  return name;
+}
+
+// IPv6 地址字符串 → 16 字节 (处理 :: 简写与 IPv4 内嵌)
+function ipv6ToBytes(ip) {
+  const buf = Buffer.alloc(16);
+  const v4m = ip.match(/(.*):([0-9.]+)$/);
+  let head, tail;
+  if (v4m && v4m[2].includes('.')) {
+    head = v4m[1]; tail = v4m[2].split('.').map(Number);
+  } else {
+    head = ip; tail = [];
+  }
+  const [hs, ts] = head.split('::');
+  let h = hs ? hs.split(':').filter(Boolean) : [];
+  const t = ts ? ts.split(':').filter(Boolean) : [];
+  while (h.length + t.length + (tail.length ? 2 : 0) < 8) h.push('0');
+  const all = h.concat(t);
+  all.forEach((part, i) => { if (part !== undefined) buf.writeUInt16BE(parseInt(part, 16) || 0, i * 2); });
+  if (tail.length) {
+    tail.forEach((b, i) => { buf.writeUInt8(b, 12 + i); });
+  }
+  return buf;
+}
+
+// 构造 DNS 应答: 复用客户端查询报文, 填上答案
+function buildResponse(msg, answers) {
+  const qnameLen = msg.length - 12;
+  const resp = Buffer.alloc(12 + qnameLen + answers.length * 16);
+  msg.copy(resp, 0, 0, 12 + qnameLen);
+  resp[2] |= 0x80; // QR
+  resp[3] |= 0x80; // RA
+  resp[6] = answers.length >> 8; resp[7] = answers.length & 0xff;
+  let off = 12 + qnameLen;
+  for (const a of answers) {
+    resp.writeUInt16BE(0xc00c, off); off += 2; // 指针 → 问题名
+    resp.writeUInt16BE(a.type, off); off += 2;
+    resp.writeUInt16BE(1, off); off += 2;      // IN
+    resp.writeUInt32BE(60, off); off += 4;     // TTL
+    if (a.type === 1) {
+      resp.writeUInt16BE(4, off); off += 2;
+      for (const b of a.ip.split('.').map(Number)) resp.writeUInt8(b, off++);
+    } else {
+      resp.writeUInt16BE(16, off); off += 2;
+      ipv6ToBytes(a.ip).copy(resp, off); off += 16;
+    }
+  }
+  return resp;
+}
+
+const netd = require('dns'); // node 内置解析 (走 bionic/netd, 不受 UDP 53 封锁影响)
+
+// 最后兜底: UDP 上游失败时, 用系统解析 (netd) 回答 (onDone 通知调用方)
+function netdFallback(msg, rinfo, qtype, onDone, qid) {
+  const host = queryName(msg);
+  if (!host || (qtype !== 1 && qtype !== 28)) {
+    log(`netd fallback q${qid}: unsupported query (qtype=${qtype})`);
+    if (onDone) onDone();
+    return;
+  }
+  const family = qtype === 1 ? 4 : 6;
+  const t1 = Date.now();
+  netd.lookup(host, { family, timeout: 5000 }, (err, ip) => {
+    if (onDone) onDone();
+    if (err) {
+      // NXDOMAIN 或解析失败: 回 rcode=3 (合法应答, 客户端正常处理)
+      const resp = Buffer.alloc(12 + msg.length - 12);
+      msg.copy(resp, 0, 0, msg.length);
+      resp[2] |= 0x80; // QR
+      resp[3] = (resp[3] & 0x70) | 0x80 | 0x03; // RA + rcode=NXDOMAIN
+      server.send(resp, rinfo.port, rinfo.address);
+      log(`netd fallback q${qid} ${host} → NXDOMAIN/err ${err.code || err.message} (${Date.now() - t1}ms)`);
+      return;
+    }
+    const resp = buildResponse(msg, [{ type: qtype, ip }]);
+    server.send(resp, rinfo.port, rinfo.address);
+    log(`netd fallback q${qid} ${host} → ${ip} (${family === 4 ? 'A' : 'AAAA'}) ${Date.now() - t1}ms`);
+  });
+}
+
+const server = dgram.createSocket('udp4');
+
+server.on('message', (msg, rinfo) => {
+  const qtype = queryType(msg);
+  const qid = msg.readUInt16BE(0).toString(16);
+  const qhost = queryName(msg) || '?';
+  const t0 = Date.now();
+  log(`>> q${qid} ${qhost} type=${qtype === 1 ? 'A' : qtype === 28 ? 'AAAA' : qtype} from ${rinfo.address}`);
+  // AAAA 屏蔽: 直接回 NOERROR+0 答案 (合法"无 IPv6 记录"), 不走上游
+  if (qtype === 28 && DISABLE_AAAA) {
+    const resp = Buffer.alloc(msg.length);
+    msg.copy(resp, 0, 0, msg.length);
+    resp[2] |= 0x80; // QR
+    resp[3] |= 0x80; // RA
+    server.send(resp, rinfo.port, rinfo.address);
+    log(`<< q${qid} ${qhost} AAAA suppressed (IPv6 disabled) ${Date.now() - t0}ms`);
+    return;
+  }
+  let done = false;
+  let netdStarted = false;
+  // 任一上游失败 → 立即启动 netd 兜底 (netd 与上游竞争, 先回先赢, done 防双发)
+  const startNetd = () => {
+    if (netdStarted || done) return;
+    netdStarted = true;
+    log(`>> q${qid} netd fallback started (${Date.now() - t0}ms in)`);
+    netdFallback(msg, rinfo, qtype, () => { done = true; }, qid);
+  };
+  let i = 0;
+  const tryNext = () => {
+    if (done) return;
+    if (i >= UPSTREAMS.length) { startNetd(); return; }
+    const [host, port] = UPSTREAMS[i++];
+    const t1 = Date.now();
+    const tag = `q${qid}->${host}`;
+    const sock = dgram.createSocket('udp4');
+    let doneHere = false;
+    const finish = (fn) => {
+      if (doneHere) return;
+      doneHere = true;
+      clearTimeout(timer);
+      sock.close();
+      fn();
+    };
+    const timer = setTimeout(() => finish(() => { log(`timeout ${tag} (${Date.now() - t1}ms)`); startNetd(); }), TIMEOUT_MS);
+    sock.on('message', (resp) => {
+      if (doneHere) return;
+      if (isBadResponse(resp, qtype)) {
+        finish(() => {
+          const n = (strikes.get(host) || 0) + 1;
+          strikes.set(host, n);
+          if (n >= MAX_STRIKES) { strikes.delete(host); demote(host); }
+          log(`bad response ${tag} (${Date.now() - t1}ms, strike ${n}/${MAX_STRIKES})`);
+          startNetd();
+        });
+        return;
+      }
+      finish(() => {
+        if (strikes.has(host)) strikes.delete(host);
+        done = true;
+        server.send(resp, rinfo.port, rinfo.address);
+        log(`<< q${qid} ${qhost} OK via ${host} (${Date.now() - t1}ms, total ${Date.now() - t0}ms)`);
+      });
+    });
+    sock.on('error', (e) => finish(() => { log(`error ${tag}: ${e.message} (${Date.now() - t1}ms)`); startNetd(); }));
+    sock.send(msg, port, host, (e) => {
+      if (e) finish(() => { log(`send error ${tag}: ${e.message}`); startNetd(); });
+    });
+  };
+  tryNext();
+});
+
+server.on('error', (e) => {
+  log(`server error: ${e.message}`);
+  if (process.stderr.isTTY) console.error(`dns53 server error: ${e.message}`);
+  // 端口被占等致命错误: 占着没意义, 直接退出 (避免僵尸进程)
+  process.exit(1);
+});
+server.bind(53, '127.0.0.1', () => {
+  refreshDns();
+  log('dns53 listening on 127.0.0.1:53');
+  if (process.stdout.isTTY) console.log('dns53 listening on 127.0.0.1:53');
+  setInterval(refreshDns, 60000);
+});
+
+DNS53_EOF
+        chmod +x "$dns53"
+        info "dns53.js 已更新: $dns53"
+
+    if ! grep -q 'dns53' "$HOME_DIR/.bashrc" 2>/dev/null; then
+        cat >> "$HOME_DIR/.bashrc" << 'BASHRC_EOF'
+
+# ===== DNS 转发器常驻 (dns53) =====
+# 背景: musl 程序 (codex/opencode) 的解析器读不到 /etc/resolv.conf (Android 没有),
+#       回退到 127.0.0.1:53, 而手机无人监听 → DNS 卡死 5s 超时。
+# dns53.js 在本机 53 端口监听, 转发到阿里/腾讯/电信 DNS, 是这些程序的唯一出路。
+# 每次打开 Termux 终端检查一次, 没在跑就拉起 (root 绑定特权端口)。
+if ! sudo -n pgrep -f "dns5[3].js" > /dev/null 2>&1; then
+    sudo -n nohup node "$HOME/.local/bin/dns53.js" > "$HOME/.codex/dns53.log" 2>&1 &
+    sleep 1
+fi
+BASHRC_EOF
+        info "dns53 常驻逻辑已写入 ~/.bashrc"
+    fi
+
+    # 立即启动
+    if ! sudo -n pgrep -f "dns5[3].js" > /dev/null 2>&1; then
+        sudo -n nohup node "$dns53" > "$HOME_DIR/.codex/dns53.log" 2>&1 &
+        sleep 1
+        ok "DNS 转发器已启动 (127.0.0.1:53)"
     else
-        tarball=$(ls "$work"/*.tgz | head -1)
+        ok "DNS 转发器已在运行"
+    fi
+
+    # 诊断工具: 一键区分 DNS / 网络 / 服务器问题
+    local dnsq="$HOME_DIR/.local/bin/dnsq.js"
+    local check="$HOME_DIR/.check_dns.sh"
+    cat > "$dnsq" << 'DNSQ_EOF'
+#!/usr/bin/env node
+// dnsq.js — 经 127.0.0.1:53 (dns53 转发链) 查询域名 A 记录
+// 用法: node dnsq.js <host>
+const { Resolver } = require('dns').promises;
+const host = process.argv[2];
+if (!host) { console.error('usage: node dnsq.js <host>'); process.exit(2); }
+const r = new Resolver({ servers: ['127.0.0.1'], timeout: 3000, retries: 0 });
+const t0 = Date.now();
+r.resolve4(host).then((ips) => {
+  console.log(`  ${host} → OK IPs=[${ips.join(',')}] (${Date.now() - t0}ms)`);
+  process.exit(0);
+}).catch((e) => {
+  console.log(`  ${host} → ★ ${e.code || 'ERR'} (${Date.now() - t0}ms)`);
+  process.exit(1);
+});
+DNSQ_EOF
+    cat > "$check" << 'CHECK_EOF'
+#!/usr/bin/env bash
+# check_dns.sh — 一键判断"DNS 问题 vs 网络/服务器问题"
+# 用法: bash ~/.check_dns.sh [域名...]
+DNSQ=/data/data/com.termux/files/home/.local/bin/dnsq.js
+LOG=/data/data/com.termux/files/home/.codex/dns53.log
+HOSTS=(api.deepseek.com integrate.api.nvidia.com opencode.ai www.baidu.com)
+[ $# -gt 0 ] && HOSTS=("$@")
+
+echo "═══ 诊断 $(date '+%F %T') ═══"
+
+echo "── dns53 状态 ──"
+if sudo -n ss -ulnp 2>/dev/null | grep -q "127.0.0.1:53"; then
+  echo "运行中"
+else
+  echo "★ 未运行! 请重开终端或手动: sudo nohup node ~/.local/bin/dns53.js &"
+fi
+grep 'dns servers:' "$LOG" 2>/dev/null | tail -1 || echo "(无日志)"
+
+echo "── 域名解析 (经 127.0.0.1:53 / dns53 转发) ──"
+for h in "${HOSTS[@]}"; do
+  timeout 6 node "$DNSQ" "$h" || true
+done
+
+echo "── HTTPS 连通性 ──"
+for u in https://api.deepseek.com/v1 https://integrate.api.nvidia.com/v1 https://opencode.ai https://www.baidu.com; do
+  printf "  %s → " "$u"
+  curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" --max-time 8 "$u" || echo "★ 超时/失败"
+done
+
+echo "── 最近 12 条 dns53 日志 ──"
+tail -12 "$LOG" 2>/dev/null || echo "无日志文件"
+CHECK_EOF
+    chmod +x "$dnsq" "$check"
+    ok "诊断工具已安装: ~/.check_dns.sh (用法: bash ~/.check_dns.sh)"
+}
+
+
+# ---------- 清理第三方残留 ----------
+# 旧版/第三方安装 (如 @xurxuo/claude-code-termux) 可能在 $PREFIX/bin/claude
+# 留下 shebang 损坏的 node 脚本/符号链接, 会遮蔽本 wrapper。
+cleanup_legacy() {
+    if [ -L "$PREFIX/bin/claude" ] || [ -f "$PREFIX/bin/claude" ]; then
+        local target
+        target="$(readlink "$PREFIX/bin/claude" 2>/dev/null || true)"
+        case "$target" in
+            *@xurxuo*|*claude-code-termux*)
+                warn "检测到第三方残留 ($PREFIX/bin/claude → $target), 移除…"
+                rm -f "$PREFIX/bin/claude"
+                if npm ls -g @xurxuo/claude-code-termux >/dev/null 2>&1; then
+                    npm uninstall -g @xurxuo/claude-code-termux >/dev/null 2>&1 || true
+                fi
+                ;;
+        esac
+    fi
+}
+
+# ---------- 安装官方 Claude Code (musl) ----------
+install_claude() {
+    local version tarball
+    info "查询最新版本…"
+    version="$(npm view "$NPM_PKG" version)" || fail "无法获取版本号 (网络问题?)"
+
+    if [ -x "$CLAUDE_BIN" ] && [ -f "$VERSION_FILE" ] && [ "$(cat "$VERSION_FILE")" = "$version" ]; then
+        ok "Claude Code $version 已是最新"
+        return 0
+    fi
+
+    info "下载 $NPM_PKG v${version} (约 300MB, 可能较慢)…"
+    work="$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/claude-install.XXXXXX")"
+    trap 'rm -rf "$work"' EXIT
+
+    if ! (cd "$work" && npm pack "$NPM_PKG@${version}" --silent >/dev/null 2>&1); then
+        tarball="$work/claude.tgz"
+        curl -fsSL --connect-timeout 15 --max-time 600 \
+            "https://registry.npmjs.org/$NPM_PKG/-/${NPM_PKG##*/}-${version}.tgz" \
+            -o "$tarball" || fail "下载失败 (npm pack 与直连均不可用)"
+    else
+        tarball="$(ls "$work"/*.tgz | head -1)"
     fi
 
     tar xzf "$tarball" -C "$work"
-    [ -f "$work/package/claude" ] || fail "tarball 内未找到 package/claude"
+    [ -f "$work/package/claude" ] || fail "tarball 内容异常 (缺少 package/claude)"
 
-    mkdir -p "$CLAUDE_DIR"
-    # 验证能跑才替换
-    local testout
-    if ! testout=$(grun "$work/package/claude" --version 2>&1); then
-        rm -rf "$work"
-        fail "二进制验证失败: $testout"
+    info "打补丁: interpreter → $MUSL_LOADER …"
+    patchelf --set-interpreter "$MUSL_LOADER" "$work/package/claude" || fail "patchelf 失败"
+    chmod +x "$work/package/claude"
+
+    info "验证新二进制 (直跑, 无 grun)…"
+    if ! env -u LD_PRELOAD SSL_CERT_FILE="$CERT_FILE" "$work/package/claude" --version >/dev/null 2>&1; then
+        fail "二进制验证失败"
     fi
 
-    mv -f "$work/package/claude" "$CLAUDE_BIN.tmp"
-    mv -f "$CLAUDE_BIN.tmp" "$CLAUDE_BIN"
+    mkdir -p "$CLAUDE_DIR"
+    mv -f "$work/package/claude" "$CLAUDE_BIN"
     chmod +x "$CLAUDE_BIN"
     echo "$version" > "$VERSION_FILE"
+    ok "Claude Code $version 已安装 (musl 直跑)"
     rm -rf "$work"
-    ok "Claude Code v$version 二进制已安装 (${testout})"
 }
 
 # ---------- 启动 wrapper ----------
-# 仿 codex-termux 思路: 本地 bash 脚本, 不用 npm 分发包
 write_wrapper() {
     mkdir -p "$HOME_DIR/.local/bin"
     cat > "$WRAPPER_PATH" << 'WRAPPER_EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
 # claude wrapper for Termux (由 claude-code-termux/install.sh 生成)
-# - 官方 glibc 二进制经 grun 转译运行
-# - claude update 一键更新 (下载 → 验证 → 替换)
-# - 注入 SSL_CERT_FILE (glibc 程序不认 Android 的 CA 路径)
+# - 官方 musl 二进制, patchelf 直跑, 无需 glibc/grun
+# - 启动前自动检查最新版本, 非最新则自动更新再启动
+#   (可用 CLAUDE_NO_AUTO_UPDATE=1 跳过检查)
+# - 关闭 Claude 自带的后台自动更新 (DISABLE_AUTOUPDATER=1),
+#   统一由本 wrapper 在启动前升级, 避免两套机制冲突
+# - 注入 SSL_CERT_FILE; unset LD_PRELOAD (termux-exec 与 musl 冲突)
+# - DNS: 有 root → dns53; 无 root → dns-bootstrap + proot (同 codex-termux)
 # ============================================================
 set -euo pipefail
 
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 CLAUDE_BIN="$HOME/.local/claude-code/claude"
 VERSION_FILE="$HOME/.local/claude-code/.version"
+NPM_PKG="@anthropic-ai/claude-code-linux-arm64-musl"
 
-# glibc 程序不认 Android 的 CA 路径, 指定 glibc 侧证书
-export SSL_CERT_FILE="${SSL_CERT_FILE:-$PREFIX/glibc/etc/ssl/cert.pem}"
-
-# grun 可能不在 PATH ($PREFIX/glibc/bin 默认不加入)
-find_grun() {
-    command -v grun 2>/dev/null || { [ -x "$PREFIX/glibc/bin/grun" ] && echo "$PREFIX/glibc/bin/grun"; } || echo "$PREFIX/bin/grun"
-}
-GRUN="$(find_grun)"
+export SSL_CERT_FILE="${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
+export DISABLE_AUTOUPDATER=1
+# 兜底: claude 的 shell 集成需要可执行的入口路径, 固定指向 wrapper
+export CLAUDE_CODE_EXECPATH="$HOME/.local/bin/claude"
+# termux-exec 的 bionic LD_PRELOAD 会让 musl 加载器报错, 必须清掉
+unset LD_PRELOAD
 
 [ -x "$CLAUDE_BIN" ] || { echo "未安装 Claude Code, 请重跑安装脚本" >&2; exit 1; }
 
+# 本地已记录版本; 无记录时从二进制本身探测 (可能为空)
+current_version() {
+    if [ -f "$VERSION_FILE" ]; then
+        cat "$VERSION_FILE"
+    else
+        "$CLAUDE_BIN" --version 2>/dev/null \
+            | grep -oE '[0-9]+(\.[0-9]+){1,3}' | head -n1 || true
+    fi
+}
+
+# npm 源上的最新版本; 失败时为空 (快速失败, 不拖慢启动)
+latest_version() {
+    npm view "$NPM_PKG" version --fetch-timeout=10000 --fetch-retries=0 2>/dev/null || true
+}
+
+# 版本比较: $1 >= $2 返回 0 (sort -V 语义)
+version_ge() {
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
+
+# 下载 → patchelf → 验证 → 原子替换。失败返回 1, 保留旧二进制。
+do_update() {
+    local VERSION="$1" WORK TARBALL NEW_BIN
+    WORK="$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/claude-update.XXXXXX")" || return 1
+    trap 'rm -rf "$WORK"' RETURN
+    echo "→ 下载 $NPM_PKG v${VERSION} (约 300MB, 可能较慢)…"
+    if ! (cd "$WORK" && npm pack "$NPM_PKG@${VERSION}" --silent >/dev/null 2>&1); then
+        TARBALL="$WORK/claude.tgz"
+        curl -fsSL --connect-timeout 15 --max-time 600 \
+            "https://registry.npmjs.org/$NPM_PKG/-/${NPM_PKG##*/}-${VERSION}.tgz" \
+            -o "$TARBALL" || { echo "!! 下载失败 (npm pack 与直连均不可用)" >&2; return 1; }
+    else
+        TARBALL="$(ls "$WORK"/*.tgz | head -1)"
+    fi
+    tar xzf "$TARBALL" -C "$WORK" || { echo "!! 解压失败" >&2; return 1; }
+    NEW_BIN="$WORK/package/claude"
+    [ -f "$NEW_BIN" ] || { echo "!! tarball 内容异常" >&2; return 1; }
+    patchelf --set-interpreter "$PREFIX/lib/ld-musl-aarch64.so.1" "$NEW_BIN" || return 1
+    chmod +x "$NEW_BIN"
+    if ! "$NEW_BIN" --version >/dev/null 2>&1; then
+        echo "!! 新二进制验证失败, 已回滚 (旧版保留)" >&2
+        return 1
+    fi
+    mkdir -p "$(dirname "$CLAUDE_BIN")"
+    mv -f "$NEW_BIN" "$CLAUDE_BIN"
+    chmod +x "$CLAUDE_BIN"
+    echo "$VERSION" > "$VERSION_FILE"
+    echo "✓ 已更新到 v$VERSION"
+}
+
 case "${1:-}" in
     --update|-u|update|upgrade)
-        echo "→ 更新 @anthropic-ai/claude-code …"
-        VERSION="$(npm view @anthropic-ai/claude-code-linux-arm64 version 2>/dev/null || true)"
-        if [ -z "$VERSION" ]; then echo "!! 无法获取最新版本" >&2; exit 1; fi
-        if [ -f "$VERSION_FILE" ] && [ "$(cat "$VERSION_FILE")" = "$VERSION" ]; then
-            echo "✓ 已是最新版本 v$VERSION"
+        FORCE=0
+        if [ "${2:-}" = "--force" ] || [ "${2:-}" = "-f" ]; then FORCE=1; fi
+        VERSION="$(latest_version)"
+        [ -n "$VERSION" ] || { echo "!! 无法获取最新版本 (网络问题?)" >&2; exit 1; }
+        CURRENT="$(current_version)"
+        if [ "$FORCE" -eq 0 ] && [ -n "$CURRENT" ] && version_ge "$CURRENT" "$VERSION"; then
+            echo "✓ 已是最新 ($CURRENT)"
             exit 0
         fi
-        echo "→ 下载 v$VERSION …"
-        WORK="$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/claude-update.XXXXXX")"
-        trap 'rm -rf "$WORK"' EXIT
-        if ! (cd "$WORK" && npm pack "@anthropic-ai/claude-code-linux-arm64@${VERSION}" --silent >/dev/null 2>&1); then
-            TARBALL="$WORK/claude.tgz"
-            curl -fsSL --connect-timeout 15 --max-time 300 \
-                "https://registry.npmjs.org/@anthropic-ai/claude-code-linux-arm64/-/claude-code-linux-arm64-${VERSION}.tgz" \
-                -o "$TARBALL" || { echo "!! 下载失败" >&2; exit 1; }
-        else
-            TARBALL="$(ls "$WORK"/*.tgz | head -1)"
-        fi
-        tar xzf "$TARBALL" -C "$WORK"
-        [ -f "$WORK/package/claude" ] || { echo "!! tarball 内容异常" >&2; exit 1; }
-        echo "→ 验证新二进制 …"
-        if ! "$GRUN" "$WORK/package/claude" --version >/dev/null 2>&1; then
-            echo "!! 新二进制验证失败, 已回滚" >&2
-            exit 1
-        fi
-        mv -f "$WORK/package/claude" "$CLAUDE_BIN"
-        chmod +x "$CLAUDE_BIN"
-        echo "$VERSION" > "$VERSION_FILE"
-        echo "✓ 已更新到 v$VERSION"
+        do_update "$VERSION" || exit 1
         ;;
     *)
-        exec "$GRUN" "$CLAUDE_BIN" "$@"
+        # 自动更新: 启动前查一次最新版 (失败静默跳过),
+        # 非最新则自动更新; 更新失败不阻塞, 用现有版本启动
+        if [ "${CLAUDE_NO_AUTO_UPDATE:-0}" != "1" ] && command -v npm >/dev/null 2>&1; then
+            LATEST="$(latest_version)"
+            if [ -n "$LATEST" ]; then
+                CURRENT="$(current_version)"
+                if [ -z "$CURRENT" ] || ! version_ge "$CURRENT" "$LATEST"; then
+                    echo "→ 检测到新版本 v${LATEST} (当前 ${CURRENT:-未知}), 自动更新…"
+                    if do_update "$LATEST"; then
+                        echo "→ 更新完毕, 继续启动 claude…"
+                    else
+                        echo "!! 自动更新失败, 继续使用现有版本启动" >&2
+                    fi
+                fi
+            fi
+        fi
+        # DNS: 与 codex-termux 相同策略
+        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            if ! sudo -n pgrep -f "dns5[3].js" > /dev/null 2>&1; then
+                sudo -n nohup node "$HOME/.local/bin/dns53.js" > "$HOME/.codex/dns53.log" 2>&1 &
+                sleep 1
+            fi
+            exec "$CLAUDE_BIN" "$@"
+        elif command -v proot >/dev/null 2>&1; then
+            [ -f "${PREFIX}/etc/resolv.conf" ] || { echo "缺少 ${PREFIX}/etc/resolv.conf, 请重跑安装脚本" >&2; exit 1; }
+            if ! pgrep -f "dns-bootstrap[.]js.*daemon" > /dev/null 2>&1; then
+                node "$HOME/.local/bin/dns-bootstrap.js" \
+                    || echo "!! 网络 DNS 全部不可用 (UDP 53 被拦截?), 已用公共 DNS 兜底继续启动" >&2
+            fi
+            exec proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$CLAUDE_BIN" "$@"
+        else
+            echo "未检测到 root 且缺少 proot, 请先安装: pkg install proot" >&2
+            exit 1
+        fi
         ;;
 esac
 WRAPPER_EOF
     chmod +x "$WRAPPER_PATH"
 
+    # 确保 ~/.local/bin 在 PATH 中且优先
     if ! grep -q '\.local/bin' "$HOME_DIR/.bashrc" 2>/dev/null; then
         echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME_DIR/.bashrc"
         info "~/.local/bin 已加入 PATH (~/.bashrc)"
@@ -200,29 +1019,10 @@ WRAPPER_EOF
     ok "启动 wrapper 已生成: $WRAPPER_PATH"
 }
 
-# ---------- 清理 DamnSit 残留 ----------
-# /usr/bin/claude 若是第三方包的损坏符号链接 (shebang /usr/bin/env), 会遮蔽 wrapper
-cleanup_legacy() {
-    if [ -L "$PREFIX/bin/claude" ] || [ -f "$PREFIX/bin/claude" ]; then
-        local target
-        target=$(readlink "$PREFIX/bin/claude" 2>/dev/null || true)
-        case "$target" in
-            *@xurxuo*|*claude-code-termux*)
-                warn "检测到第三方残留 ($PREFIX/bin/claude → $target), 移除…"
-                rm -f "$PREFIX/bin/claude"
-                if npm ls -g @xurxuo/claude-code-termux >/dev/null 2>&1; then
-                    npm uninstall -g @xurxuo/claude-code-termux >/dev/null 2>&1 || true
-                    warn "已卸载 npm 包 @xurxuo/claude-code-termux"
-                fi
-                ;;
-        esac
-    fi
-}
-
 # ---------- 验证 ----------
 verify() {
     local ver
-    ver=$(PATH="$HOME_DIR/.local/bin:$PATH" "$WRAPPER_PATH" --version 2>/dev/null) \
+    ver="$(PATH="$HOME_DIR/.local/bin:$PATH" "$WRAPPER_PATH" --version 2>/dev/null)" \
         || fail "验证失败: claude 无法运行"
     ok "安装成功: $ver"
 }
@@ -230,9 +1030,11 @@ verify() {
 # ---------- 卸载 ----------
 uninstall() {
     warn "将卸载 Claude Code 并移除 wrapper…"
+    npm uninstall -g "$NPM_PKG" >/dev/null 2>&1 || true
     rm -f "$WRAPPER_PATH"
     rm -rf "$CLAUDE_DIR"
     ok "已卸载。配置目录 (~/.claude) 保留, 如需删除: rm -rf ~/.claude"
+    warn "dns53/dns-bootstrap 已保留 — codex/opencode 等其他 musl 程序可能依赖它们"
     exit 0
 }
 
@@ -243,16 +1045,21 @@ show_guide() {
     echo "  安装完成! 下一步: 配置 API Key"
     echo "=============================================================="
     echo
-    echo "  export ANTHROPIC_API_KEY=sk-ant-你的Key"
-    echo "  (持久化: echo 'export ANTHROPIC_API_KEY=sk-ant-你的Key' >> ~/.bashrc)"
+    echo "  DeepSeek (Anthropic 兼容网关) 示例:"
+    echo "    export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic"
+    echo "    export ANTHROPIC_AUTH_TOKEN=sk-ant-你的Key"
+    echo "    export ANTHROPIC_MODEL=deepseek-v4-flash[1m]"
+    echo "  (持久化: 把上面三行追加到 ~/.bashrc)"
     echo
     echo "  常用命令:"
-    echo "    claude            启动"
-    echo "    claude update     更新到最新版"
-    echo "    重跑本脚本即更新    (bash install.sh)"
+    echo "    claude               启动 (启动前自动检查更新)"
+    echo "    claude update        手动更新到最新版"
+    echo "    claude update -f     强制重装当前版本"
+    echo "    CLAUDE_NO_AUTO_UPDATE=1 claude   跳过启动时更新检查"
+    echo "    重跑本脚本即更新      (bash install.sh)"
     echo "    重跑本脚本 --uninstall 卸载"
     echo
-    echo "  官方文档: https://docs.anthropic.com/en/docs/claude-code"
+    echo "  官方文档: $UPSTREAM_DOCS_URL"
     echo "=============================================================="
 }
 
@@ -261,9 +1068,13 @@ case "${1:-}" in
     --uninstall) uninstall ;;
 esac
 
-info "claude-code-termux 安装脚本 — 仅支持 Termux aarch64"
+info "claude-code-termux 安装脚本 (musl 直跑版) — 仅支持 Termux aarch64"
+mkdir -p "$HOME_DIR/.codex" "$HOME_DIR/.local/bin"
 check_environment
+fix_mirror
+upgrade_packages
 install_dependencies
+fix_cert
 fix_dns
 cleanup_legacy
 install_claude
