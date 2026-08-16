@@ -81,7 +81,7 @@ bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 
 Claude 的 musl 二进制和 codex/opencode 行为一致：读不到 `/etc/resolv.conf`（Android 没有）就回退 `127.0.0.1:53`。wrapper 启动前自动选择：
 
-- **有 root**：确保 `dns53.js` 在 `127.0.0.1:53` 监听。dns53 每 60 秒用 `getprop` + `dumpsys connectivity` 探测手机当前 DNS 并刷新上游，坏应答自动降级，全挂时 netd 兜底——客户端永远查本地，网络切换实时跟随
+- **有 root**：确保 `dns53.js` 在 `127.0.0.1:53` 监听。dns53 每 60 秒用 `getprop` + `dumpsys connectivity` 探测手机当前 DNS 并刷新上游，坏应答自动降级，全挂时 netd 兜底——客户端永远查本地，网络切换实时跟随；可用 `dns53-aaaa on|off|status` 一键切换 AAAA 屏蔽
 - **无 root**：启动时用 `dns-bootstrap.js` 实测公网 DNS 质量并重写 `$PREFIX/etc/resolv.conf`，再用 `proot -b` 绑定成 `/etc/resolv.conf` 启动
 
 与 codex-termux 共用同一套 DNS 脚本和常驻逻辑，互不冲突。
