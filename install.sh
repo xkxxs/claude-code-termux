@@ -922,8 +922,19 @@ install_claude() {
     chmod +x "$work/package/claude"
 
     info "验证新二进制 (直跑, 无 grun)…"
-    if ! env -u LD_PRELOAD SSL_CERT_FILE="$CERT_FILE" "$work/package/claude" --version >/dev/null 2>&1; then
-        fail "二进制验证失败"
+    # 无 root 时 musl 二进制被 Android seccomp 拦截 → Bad system call, 需走 proot
+    local verify_ok=0
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        env -u LD_PRELOAD SSL_CERT_FILE="$CERT_FILE" "$work/package/claude" --version >/dev/null 2>&1 && verify_ok=1
+    elif command -v proot >/dev/null 2>&1; then
+        proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" \
+            env -u LD_PRELOAD SSL_CERT_FILE="$CERT_FILE" \
+            "$work/package/claude" --version >/dev/null 2>&1 && verify_ok=1
+    else
+        env -u LD_PRELOAD SSL_CERT_FILE="$CERT_FILE" "$work/package/claude" --version >/dev/null 2>&1 && verify_ok=1
+    fi
+    if [ "$verify_ok" -ne 1 ]; then
+        fail "二进制验证失败 (如无 root 请确保已安装 proot)"
     fi
 
     mkdir -p "$CLAUDE_DIR"
@@ -965,12 +976,24 @@ unset LD_PRELOAD
 
 [ -x "$CLAUDE_BIN" ] || { echo "未安装 Claude Code, 请重跑安装脚本" >&2; exit 1; }
 
+# 运行 claude 二进制: 有 root 直跑, 无 root 走 proot (避免 seccomp 拦截 musl 系统调用)
+run_claude() {
+    local bin="$1"; shift
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        "$bin" "$@"
+    elif command -v proot >/dev/null 2>&1; then
+        proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$bin" "$@"
+    else
+        "$bin" "$@"
+    fi
+}
+
 # 本地已记录版本; 无记录时从二进制本身探测 (可能为空)
 current_version() {
     if [ -f "$VERSION_FILE" ]; then
         cat "$VERSION_FILE"
     else
-        "$CLAUDE_BIN" --version 2>/dev/null \
+        run_claude "$CLAUDE_BIN" --version 2>/dev/null \
             | grep -oE '[0-9]+(\.[0-9]+){1,3}' | head -n1 || true
     fi
 }
@@ -1004,7 +1027,7 @@ do_update() {
     [ -f "$NEW_BIN" ] || { echo "!! tarball 内容异常" >&2; return 1; }
     patchelf --set-interpreter "$PREFIX/lib/ld-musl-aarch64.so.1" "$NEW_BIN" || return 1
     chmod +x "$NEW_BIN"
-    if ! "$NEW_BIN" --version >/dev/null 2>&1; then
+    if ! run_claude "$NEW_BIN" --version >/dev/null 2>&1; then
         echo "!! 新二进制验证失败, 已回滚 (旧版保留)" >&2
         return 1
     fi
