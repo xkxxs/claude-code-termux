@@ -907,9 +907,14 @@ install_claude() {
 
     if ! (cd "$work" && npm pack "$NPM_PKG@${version}" --silent >/dev/null 2>&1); then
         tarball="$work/claude.tgz"
+        # registry.npmjs.org 国内常超时 → npmmirror 兜底
         curl -fsSL --connect-timeout 15 --max-time 600 \
             "https://registry.npmjs.org/$NPM_PKG/-/${NPM_PKG##*/}-${version}.tgz" \
-            -o "$tarball" || fail "下载失败 (npm pack 与直连均不可用)"
+            -o "$tarball" \
+        || curl -fsSL --connect-timeout 15 --max-time 600 \
+            "https://registry.npmmirror.com/$NPM_PKG/-/${NPM_PKG##*/}-${version}.tgz" \
+            -o "$tarball" \
+        || fail "下载失败 (npm pack / npmjs / npmmirror 均不可用)"
     else
         tarball="$(ls "$work"/*.tgz | head -1)"
     fi
@@ -1016,9 +1021,14 @@ do_update() {
     echo "→ 下载 $NPM_PKG v${VERSION} (约 300MB, 可能较慢)…"
     if ! (cd "$WORK" && npm pack "$NPM_PKG@${VERSION}" --silent >/dev/null 2>&1); then
         TARBALL="$WORK/claude.tgz"
+        # registry.npmjs.org 国内常超时 → npmmirror 兜底
         curl -fsSL --connect-timeout 15 --max-time 600 \
             "https://registry.npmjs.org/$NPM_PKG/-/${NPM_PKG##*/}-${VERSION}.tgz" \
-            -o "$TARBALL" || { echo "!! 下载失败 (npm pack 与直连均不可用)" >&2; return 1; }
+            -o "$TARBALL" \
+        || curl -fsSL --connect-timeout 15 --max-time 600 \
+            "https://registry.npmmirror.com/$NPM_PKG/-/${NPM_PKG##*/}-${VERSION}.tgz" \
+            -o "$TARBALL" \
+        || { echo "!! 下载失败 (npm pack / npmjs / npmmirror 均不可用)" >&2; return 1; }
     else
         TARBALL="$(ls "$WORK"/*.tgz | head -1)"
     fi
