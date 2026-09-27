@@ -35,7 +35,13 @@ NPM_PKG="@anthropic-ai/claude-code-linux-arm64-musl"
 CERT_FILE="$PREFIX/etc/tls/cert.pem"
 MUSL_LOADER="$PREFIX/lib/ld-musl-aarch64.so.1"
 RESOLV_CONF="$PREFIX/etc/resolv.conf"
-MUSL_APK_URL="https://dl-cdn.alpinelinux.org/alpine/edge/main/aarch64/musl-1.2.6-r2.apk"
+# Alpine 镜像 (动态解析版本, 不硬编码 — 见 install_musl_loader 上方说明)
+ALPINE_MIRRORS=(
+    "https://mirrors.tuna.tsinghua.edu.cn/alpine/latest-stable/main/aarch64"
+    "https://mirrors.aliyun.com/alpine/latest-stable/main/aarch64"
+    "https://mirrors.ustc.edu.cn/alpine/latest-stable/main/aarch64"
+    "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/aarch64"
+)
 UPSTREAM_DOCS_URL="https://docs.anthropic.com/en/docs/claude-code"
 
 # ---------- 颜色 ----------
@@ -126,14 +132,56 @@ upgrade_packages() {
 # ---------- musl loader ----------
 # 官方 musl 二进制动态链接 /lib/ld-musl-aarch64.so.1, Termux 没有, 从 Alpine 拉。
 # (opencode 方案同款; 已存在则跳过)
+# ---------- Alpine 源: 动态版本 + 多镜像回退 ----------
+# 不能硬编码 apk 版本号: Alpine 的 edge 是滚动分支, 旧版本会被直接轮掉
+# (musl-1.2.6-r2 在 edge 已经 404 了), 所以固定用 latest-stable 分支,
+# 并从 APKINDEX.tar.gz (解压出来是纯文本索引) 取当前版本号。
+ALPINE_BASE=""
+
+apk_mirror_host() { local h="${1#https://}"; printf '%s' "${h%%/*}"; }
+
+# $1=索引保存路径; 成功后把选中的镜像放进 ALPINE_BASE
+alpine_select_mirror() {
+    local m
+    for m in "${ALPINE_MIRRORS[@]}"; do
+        if curl -fsSL --connect-timeout 8 --max-time 30 "$m/APKINDEX.tar.gz" -o "$1" 2>/dev/null; then
+            ALPINE_BASE="$m"
+            ok "Alpine 镜像: $(apk_mirror_host "$m")"
+            return 0
+        fi
+    done
+    fail "所有 Alpine 镜像都取不到 APKINDEX (网络问题?)"
+}
+
+# $1=索引路径 $2=包名 → 输出当前版本号
+alpine_version() {
+    tar -xzOf "$1" APKINDEX 2>/dev/null \
+        | awk -F: -v p="$2" '$1=="P" && $2==p {f=1; next} f && $1=="V" {print $2; exit}'
+}
+
+# $1=索引路径 $2=包名 $3=输出文件
+alpine_fetch_apk() {
+    local ver m
+    ver="$(alpine_version "$1" "$2")"
+    [ -n "$ver" ] || fail "APKINDEX 里解析不到 $2 的版本号"
+    for m in "${ALPINE_MIRRORS[@]}"; do
+        if curl -fsSL --connect-timeout 10 --max-time 120 "$m/$2-$ver.apk" -o "$3" 2>/dev/null; then
+            info "$2-$ver.apk ← $(apk_mirror_host "$m")"
+            return 0
+        fi
+    done
+    fail "$2.apk 下载失败 (已试 ${#ALPINE_MIRRORS[@]} 个镜像)"
+}
+
 install_musl_loader() {
     [ -x "$MUSL_LOADER" ] && { ok "musl loader 已存在: $MUSL_LOADER"; return 0; }
     info "下载 musl 动态链接器 (Alpine)…"
-    local tmp
+    local tmp idx
     tmp="$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/musl-loader.XXXXXX")"
+    idx="$tmp/APKINDEX.tar.gz"
     trap 'rm -rf "$tmp"' RETURN
-    curl -fsSL --connect-timeout 15 --max-time 120 "$MUSL_APK_URL" -o "$tmp/musl.apk" \
-        || fail "musl apk 下载失败: $MUSL_APK_URL"
+    alpine_select_mirror "$idx"
+    alpine_fetch_apk "$idx" musl "$tmp/musl.apk"
     (cd "$tmp" && tar xzf musl.apk) || fail "musl apk 解压失败"
     [ -f "$tmp/lib/ld-musl-aarch64.so.1" ] || fail "apk 中未找到 ld-musl-aarch64.so.1"
     cp "$tmp/lib/ld-musl-aarch64.so.1" "$PREFIX/lib/"
