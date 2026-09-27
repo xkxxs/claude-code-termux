@@ -51,6 +51,64 @@ info() { echo -e "${BLU}▸${NC} $*"; }
 warn() { echo -e "${YEL}⚠${NC} $*"; }
 fail() { echo -e "${RED}✗${NC} $*"; exit 1; }
 
+# ---------- 进度显示 ----------
+# 背景: npm pack / npm install 全程不显示进度, 300MB 的包会让用户以为卡死。
+# ① 下载: 先用 `npm view <spec> dist.tarball` 拿真实 URL —— 该命令跟随用户
+#    配置的 registry (如 npmmirror) —— 再用 curl --progress-bar 下载,
+#    有进度条/速度/剩余时间; 失败换另一个镜像, 最后才回退 npm pack (无进度)。
+# ② 其它无输出的长步骤 (如 npm install -g): 用转圈 + 已耗时提示。
+SPIN_CHARS='|/-\'
+SPIN_LOG=""
+
+# $1=提示语, 其余=要执行的命令; 输出存入 $SPIN_LOG, 失败时自动打印
+run_with_spinner() {
+    local msg="$1"; shift
+    SPIN_LOG="${TMPDIR:-$PREFIX/tmp}/spin.$$.log"
+    "$@" >"$SPIN_LOG" 2>&1 &
+    local pid=$! i=0 t0=$SECONDS
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r\033[K%s %s (%ds)' "$msg" "${SPIN_CHARS:$((i++ % 4)):1}" "$((SECONDS - t0))"
+        sleep 0.5
+    done
+    wait "$pid"; local rc=$?
+    printf '\r\033[K'
+    if [ "$rc" -ne 0 ]; then
+        warn "$msg 失败, 输出如下:"
+        cat "$SPIN_LOG" >&2
+    else
+        echo -e "${msg} ${GRN}完成${NC} (${SECONDS}秒)"
+    fi
+    return $rc
+}
+
+# $1=npm spec → 输出 tarball URL (跟随 registry 配置)
+npm_tarball_url() { npm view "$1" dist.tarball 2>/dev/null | tail -1; }
+
+# $1=npm spec  $2=输出文件
+download_npm_tarball() {
+    local spec="$1" out="$2" url="" alt=""
+    url="$(npm_tarball_url "$spec")"
+    if [ -n "$url" ]; then
+        curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$url" -o "$out" && return 0
+        # 换镜像再试一次: npmjs ↔ npmmirror
+        case "$url" in
+            *registry.npmjs.org*)     alt="${url/registry.npmjs.org/registry.npmmirror.com}" ;;
+            *registry.npmmirror.com*) alt="${url/registry.npmmirror.com/registry.npmjs.org}" ;;
+        esac
+        if [ -n "$alt" ] && [ "$alt" != "$url" ]; then
+            warn "直连失败, 换镜像重试…"
+            curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$alt" -o "$out" && return 0
+        fi
+    fi
+    info "直连失败, 回退 npm pack (此方式无进度显示)…"
+    (cd "$(dirname "$out")" && npm pack "$spec" --silent >/dev/null 2>&1) || return 1
+    local packed
+    packed="$(ls "$(dirname "$out")"/*.tgz 2>/dev/null | head -1)"
+    [ -n "$packed" ] || return 1
+    [ "$packed" = "$out" ] || mv -f "$packed" "$out"
+    return 0
+}
+
 # ---------- 环境检查 ----------
 check_environment() {
     if [ "$(uname -o 2>/dev/null || true)" != "Android" ] && [ ! -x "$PREFIX/bin/pkg" ]; then
@@ -973,19 +1031,9 @@ install_claude() {
     # 同上: 双引号让路径立即展开, 避免 EXIT 触发时 $work 已出作用域
     trap "rm -rf '$work'" EXIT
 
-    if ! (cd "$work" && npm pack "$NPM_PKG@${version}" --silent >/dev/null 2>&1); then
-        tarball="$work/claude.tgz"
-        # registry.npmjs.org 国内常超时 → npmmirror 兜底
-        curl -fsSL --connect-timeout 15 --max-time 600 \
-            "https://registry.npmjs.org/$NPM_PKG/-/${NPM_PKG##*/}-${version}.tgz" \
-            -o "$tarball" \
-        || curl -fsSL --connect-timeout 15 --max-time 600 \
-            "https://registry.npmmirror.com/$NPM_PKG/-/${NPM_PKG##*/}-${version}.tgz" \
-            -o "$tarball" \
-        || fail "下载失败 (npm pack / npmjs / npmmirror 均不可用)"
-    else
-        tarball="$(ls "$work"/*.tgz | head -1)"
-    fi
+    tarball="$work/claude.tgz"
+    download_npm_tarball "$NPM_PKG@${version}" "$tarball" \
+        || fail "下载失败 (curl 直连 / 换镜像 / npm pack 均不可用)"
 
     tar xzf "$tarball" -C "$work"
     [ -f "$work/package/claude" ] || fail "tarball 内容异常 (缺少 package/claude)"
@@ -1049,6 +1097,34 @@ unset LD_PRELOAD
 
 [ -x "$CLAUDE_BIN" ] || { echo "未安装 Claude Code, 请重跑安装脚本" >&2; exit 1; }
 
+# ---------- 下载进度 ----------
+# npm pack 不显示进度 (300MB 的包会让人以为卡死): 先用 npm view 拿真实 URL
+# (跟随 registry 配置), 再用 curl --progress-bar 下载; 失败换镜像, 再回退 npm pack。
+npm_tarball_url() { npm view "$1" dist.tarball 2>/dev/null | tail -1; }
+
+download_npm_tarball() {
+    local spec="$1" out="$2" url="" alt=""
+    url="$(npm_tarball_url "$spec")"
+    if [ -n "$url" ]; then
+        curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$url" -o "$out" && return 0
+        case "$url" in
+            *registry.npmjs.org*)     alt="${url/registry.npmjs.org/registry.npmmirror.com}" ;;
+            *registry.npmmirror.com*) alt="${url/registry.npmmirror.com/registry.npmjs.org}" ;;
+        esac
+        if [ -n "$alt" ] && [ "$alt" != "$url" ]; then
+            echo "!! 直连失败, 换镜像重试…" >&2
+            curl -fSL --progress-bar --connect-timeout 15 --max-time 900 "$alt" -o "$out" && return 0
+        fi
+    fi
+    echo "→ 直连失败, 回退 npm pack (无进度显示)…" >&2
+    (cd "$(dirname "$out")" && npm pack "$spec" --silent >/dev/null 2>&1) || return 1
+    local packed
+    packed="$(ls "$(dirname "$out")"/*.tgz 2>/dev/null | head -1)"
+    [ -n "$packed" ] || return 1
+    [ "$packed" = "$out" ] || mv -f "$packed" "$out"
+    return 0
+}
+
 # 运行 claude 二进制: 有 root 直跑, 无 root 走 proot (避免 seccomp 拦截 musl 系统调用)
 run_claude() {
     local bin="$1"; shift
@@ -1088,19 +1164,9 @@ do_update() {
     # 同上: 双引号让路径立即展开, 避免 RETURN trap 泄漏到调用方后 $WORK 未绑定
     trap "rm -rf '$WORK'" RETURN
     echo "→ 下载 $NPM_PKG v${VERSION} (约 300MB, 可能较慢)…"
-    if ! (cd "$WORK" && npm pack "$NPM_PKG@${VERSION}" --silent >/dev/null 2>&1); then
-        TARBALL="$WORK/claude.tgz"
-        # registry.npmjs.org 国内常超时 → npmmirror 兜底
-        curl -fsSL --connect-timeout 15 --max-time 600 \
-            "https://registry.npmjs.org/$NPM_PKG/-/${NPM_PKG##*/}-${VERSION}.tgz" \
-            -o "$TARBALL" \
-        || curl -fsSL --connect-timeout 15 --max-time 600 \
-            "https://registry.npmmirror.com/$NPM_PKG/-/${NPM_PKG##*/}-${VERSION}.tgz" \
-            -o "$TARBALL" \
-        || { echo "!! 下载失败 (npm pack / npmjs / npmmirror 均不可用)" >&2; return 1; }
-    else
-        TARBALL="$(ls "$WORK"/*.tgz | head -1)"
-    fi
+    TARBALL="$WORK/claude.tgz"
+    download_npm_tarball "$NPM_PKG@${VERSION}" "$TARBALL" \
+        || { echo "!! 下载失败 (curl 直连 / 换镜像 / npm pack 均不可用)" >&2; return 1; }
     tar xzf "$TARBALL" -C "$WORK" || { echo "!! 解压失败" >&2; return 1; }
     NEW_BIN="$WORK/package/claude"
     [ -f "$NEW_BIN" ] || { echo "!! tarball 内容异常" >&2; return 1; }
