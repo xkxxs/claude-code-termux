@@ -195,7 +195,10 @@ install_musl_loader() {
     local tmp idx
     tmp="$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/musl-loader.XXXXXX")"
     idx="$tmp/APKINDEX.tar.gz"
-    trap 'rm -rf "$tmp"' RETURN
+    # 必须双引号: 让路径在设置时就展开成字面量。
+    # 单引号版本会在"函数返回时"才求值, 而 RETURN trap 还会泄漏到调用方
+    # (调用方返回时再次触发), 那时 $tmp 已出作用域 → set -u 报 unbound variable。
+    trap "rm -rf '$tmp'" RETURN
     alpine_select_mirror "$idx"
     alpine_fetch_apk "$idx" musl "$tmp/musl.apk"
     (cd "$tmp" && tar xzf musl.apk) || fail "musl apk 解压失败"
@@ -967,7 +970,8 @@ install_claude() {
 
     info "下载 $NPM_PKG v${version} (约 300MB, 可能较慢)…"
     work="$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/claude-install.XXXXXX")"
-    trap 'rm -rf "$work"' EXIT
+    # 同上: 双引号让路径立即展开, 避免 EXIT 触发时 $work 已出作用域
+    trap "rm -rf '$work'" EXIT
 
     if ! (cd "$work" && npm pack "$NPM_PKG@${version}" --silent >/dev/null 2>&1); then
         tarball="$work/claude.tgz"
@@ -1081,7 +1085,8 @@ version_ge() {
 do_update() {
     local VERSION="$1" WORK TARBALL NEW_BIN
     WORK="$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/claude-update.XXXXXX")" || return 1
-    trap 'rm -rf "$WORK"' RETURN
+    # 同上: 双引号让路径立即展开, 避免 RETURN trap 泄漏到调用方后 $WORK 未绑定
+    trap "rm -rf '$WORK'" RETURN
     echo "→ 下载 $NPM_PKG v${VERSION} (约 300MB, 可能较慢)…"
     if ! (cd "$WORK" && npm pack "$NPM_PKG@${VERSION}" --silent >/dev/null 2>&1); then
         TARBALL="$WORK/claude.tgz"
