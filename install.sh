@@ -30,6 +30,7 @@ HOME_DIR="${HOME:-/data/data/com.termux/files/home}"
 CLAUDE_DIR="$HOME_DIR/.local/claude-code"
 CLAUDE_BIN="$CLAUDE_DIR/claude"
 VERSION_FILE="$CLAUDE_DIR/.version"
+MODE_FILE="$CLAUDE_DIR/.mode"   # native (patchelf) / proot-bind
 WRAPPER_PATH="$HOME_DIR/.local/bin/claude"
 NPM_PKG="@anthropic-ai/claude-code-linux-arm64-musl"
 CERT_FILE="$PREFIX/etc/tls/cert.pem"
@@ -1031,6 +1032,25 @@ cleanup_legacy() {
     fi
 }
 
+# ---------- proot 绑定运行 (patchelf 靠不住时的兜底) ----------
+# Termux 的 patchelf 0.19.2 会把某些大体积 musl 二进制改坏 (打完补丁一跑就
+# SIGSEGV, opencode V2 上已复现)。此时二进制保持官方原样, 改由 proot 把
+# musl loader / 运行库绑到它原本要找的标准路径上 —— 完全不需要 patchelf。
+proot_bind_run() {
+    local bin="$1"; shift
+    local opts=(-b "${MUSL_LOADER:-$PREFIX/lib/ld-musl-aarch64.so.1}:/lib/ld-musl-aarch64.so.1")
+    if [ -f "${PREFIX}/lib/musl/libstdc++.so.6" ]; then
+        opts+=(-b "${PREFIX}/lib/musl/libstdc++.so.6:/usr/lib/libstdc++.so.6")
+    fi
+    if [ -f "${PREFIX}/lib/musl/libgcc_s.so.1" ]; then
+        opts+=(-b "${PREFIX}/lib/musl/libgcc_s.so.1:/usr/lib/libgcc_s.so.1")
+    fi
+    if [ -f "${PREFIX}/etc/resolv.conf" ]; then
+        opts+=(-b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf")
+    fi
+    proot "${opts[@]}" env -u LD_PRELOAD SSL_CERT_FILE="$CERT_FILE" "$bin" "$@"
+}
+
 # ---------- 安装官方 Claude Code (musl) ----------
 install_claude() {
     local version tarball
@@ -1054,8 +1074,12 @@ install_claude() {
     tar xzf "$tarball" -C "$work"
     [ -f "$work/package/claude" ] || fail "tarball 内容异常 (缺少 package/claude)"
 
+    local mode=native
+    cp "$work/package/claude" "$work/claude.orig"   # 留一份未打补丁的
+
     info "打补丁: interpreter → $MUSL_LOADER …"
-    patchelf --set-interpreter "$MUSL_LOADER" "$work/package/claude" || fail "patchelf 失败"
+    patchelf --set-interpreter "$MUSL_LOADER" "$work/package/claude" \
+        || warn "patchelf 失败 (将改用 proot 绑定模式)"
     chmod +x "$work/package/claude"
 
     info "验证新二进制 (直跑, 无 grun)…"
@@ -1070,15 +1094,33 @@ install_claude() {
     else
         env -u LD_PRELOAD SSL_CERT_FILE="$CERT_FILE" "$work/package/claude" --version >/dev/null 2>&1 && verify_ok=1
     fi
+
     if [ "$verify_ok" -ne 1 ]; then
-        fail "二进制验证失败 (如无 root 请确保已安装 proot)"
+        warn "patchelf 后的二进制跑不起来 (Termux patchelf 0.19.2 会改坏大体积 musl 二进制)"
+        info "改用 proot 绑定运行库模式 (二进制保持官方原样, 由 proot 绑 musl loader)"
+        if ! command -v proot >/dev/null 2>&1; then
+            info "安装 proot…"
+            pkg install -y proot || true
+        fi
+        command -v proot >/dev/null 2>&1 \
+            || fail "该模式需要 proot, 但安装失败。请手动: pkg install proot"
+        chmod +x "$work/claude.orig"
+        if proot_bind_run "$work/claude.orig" --version >/dev/null 2>&1; then
+            cp -f "$work/claude.orig" "$work/package/claude"
+            chmod +x "$work/package/claude"
+            mode=proot-bind
+            ok "proot 绑定模式验证通过"
+        else
+            fail "二进制验证失败 (patchelf 与 proot 绑定两种模式都不行)"
+        fi
     fi
 
     mkdir -p "$CLAUDE_DIR"
     mv -f "$work/package/claude" "$CLAUDE_BIN"
     chmod +x "$CLAUDE_BIN"
     echo "$version" > "$VERSION_FILE"
-    ok "Claude Code $version 已安装 (musl 直跑)"
+    echo "$mode" > "$MODE_FILE"
+    ok "Claude Code $version 已安装 (运行模式: $mode)"
     rm -rf "$work"
 }
 
@@ -1102,6 +1144,7 @@ set -euo pipefail
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 CLAUDE_BIN="$HOME/.local/claude-code/claude"
 VERSION_FILE="$HOME/.local/claude-code/.version"
+MODE_FILE="$HOME/.local/claude-code/.mode"   # native (patchelf) / proot-bind
 NPM_PKG="@anthropic-ai/claude-code-linux-arm64-musl"
 
 export SSL_CERT_FILE="${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
@@ -1144,7 +1187,12 @@ download_npm_tarball() {
 # 运行 claude 二进制: 有 root 直跑, 无 root 走 proot (避免 seccomp 拦截 musl 系统调用)
 run_claude() {
     local bin="$1"; shift
-    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    # proot-bind 模式 (patchelf 把二进制改坏时的兜底): 二进制未打补丁,
+    # 必须经 proot 把 musl loader 绑到 /lib/ld-musl-aarch64.so.1 才能跑
+    if [ "$(cat "$MODE_FILE" 2>/dev/null || echo native)" = "proot-bind" ] \
+       && command -v proot >/dev/null 2>&1; then
+        proot_bind_run "$bin" "$@"
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
         "$bin" "$@"
     elif command -v proot >/dev/null 2>&1; then
         proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$bin" "$@"
@@ -1228,6 +1276,18 @@ case "${1:-}" in
                     fi
                 fi
             fi
+        fi
+        # proot-bind 模式: 二进制未打补丁, 靠 proot 把 musl loader 绑到标准路径
+        if [ "$(cat "$MODE_FILE" 2>/dev/null || echo native)" = "proot-bind" ] \
+           && command -v proot >/dev/null 2>&1; then
+            BINDS=(-b "${PREFIX}/lib/ld-musl-aarch64.so.1:/lib/ld-musl-aarch64.so.1")
+            [ -f "${PREFIX}/lib/musl/libstdc++.so.6" ] \
+                && BINDS+=(-b "${PREFIX}/lib/musl/libstdc++.so.6:/usr/lib/libstdc++.so.6")
+            [ -f "${PREFIX}/lib/musl/libgcc_s.so.1" ] \
+                && BINDS+=(-b "${PREFIX}/lib/musl/libgcc_s.so.1:/usr/lib/libgcc_s.so.1")
+            [ -f "${PREFIX}/etc/resolv.conf" ] \
+                && BINDS+=(-b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf")
+            exec proot "${BINDS[@]}" "$CLAUDE_BIN" "$@"
         fi
         # DNS: 与 codex-termux 相同策略
         if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
