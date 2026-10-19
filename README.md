@@ -60,7 +60,7 @@ bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/c
 | 步骤 | 说明 |
 |---|---|
 | 环境检查 | 仅支持 Termux + aarch64 |
-| 镜像源适配 | 官方源 + 国内主流镜像逐个测速，自动切换最快者（幂等） |
+| 镜像源适配 | 官方源 + 国内主流镜像逐个探测 + 测速，按**新鲜度优先、速度兜底**选源（幂等）。Release 落后最新超过 12 小时的源会被跳过——快的源不一定同步得勤（实测腾讯云曾落后 4 个月） |
 | 全量升级 | `pkg upgrade -y` 把软件包升到最新 |
 | 依赖安装 | `nodejs-lts` + `patchelf`；musl loader 缺失时从 Alpine 拉取；无 root 自动补 proot |
 | 证书 | 使用 Termux 原生 `$PREFIX/etc/tls/cert.pem` |
