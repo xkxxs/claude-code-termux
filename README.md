@@ -64,7 +64,7 @@ bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/c
 | 全量升级 | `pkg upgrade -y` 把软件包升到最新 |
 | 依赖安装 | `nodejs-lts` + `patchelf`；musl loader 缺失时从 Alpine 拉取；无 root 自动补 proot |
 | 证书 | 使用 Termux 原生 `$PREFIX/etc/tls/cert.pem` |
-| **DNS（复用 codex-termux）** | 有 root：`dns53.js` 本地转发器 + `.bashrc` 常驻（自动跟随手机 DNS）；无 root：`dns-bootstrap.js` 实测校验 + proot 绑定 |
+| **DNS** | 安装独立的 `dns53` 组件到 `~/.local/share/dns53`（不属于任何 agent）；有 root：转发器 + `.bashrc` 常驻（自动跟随手机 DNS）；无 root：`dns-bootstrap.js` 实测校验 + proot 绑定 |
 | 清理残留 | 自动检测并移除第三方损坏的 `$PREFIX/bin/claude`（如 @xurxuo 包残留） |
 | 安装 Claude | `npm pack @anthropic-ai/claude-code-linux-arm64-musl` → patchelf 改 interpreter → 直跑验证 → 放入 `~/.local/claude-code/claude` |
 | 生成 wrapper | `~/.local/bin/claude`：启动前自动检查更新、注入证书、`unset LD_PRELOAD`、DNS 自选、`claude update` 手动升级 |
@@ -87,14 +87,20 @@ bash <(curl -fsSL …/install.sh) --uninstall  # 卸载
 > - 更新失败（网络中断等）→ 不阻塞，直接用现有版本启动，下次再试
 > - 已是最新 → 直接启动，零额外等待
 
-## DNS（复用 codex-termux 成熟方案）
+## DNS（独立 dns53 组件）
 
 Claude 的 musl 二进制和 codex/opencode 行为一致：读不到 `/etc/resolv.conf`（Android 没有）就回退 `127.0.0.1:53`。wrapper 启动前自动选择：
 
+- 组件安装在 `~/.local/share/dns53`，与 codex/opencode 共用同一份；删除 agent 目录不影响它。
 - **有 root**：确保 `dns53.js` 在 `127.0.0.1:53` 监听。dns53 每 60 秒用 `getprop` + `dumpsys connectivity` 探测手机当前 DNS 并刷新上游，坏应答自动降级，全挂时 netd 兜底——客户端永远查本地，网络切换实时跟随；可用 `dns53-aaaa on|off|status` 一键切换 AAAA 屏蔽
 - **无 root**：启动时用 `dns-bootstrap.js` 实测公网 DNS 质量并重写 `$PREFIX/etc/resolv.conf`，再用 `proot -b` 绑定成 `/etc/resolv.conf` 启动
 
 与 codex-termux 共用同一套 DNS 脚本和常驻逻辑，互不冲突。
+
+- 安装/升级：`bash ~/.local/share/dns53/install.sh`
+- 状态：`bash ~/.local/share/dns53/install.sh --status`
+- 卸载（只删组件）：`bash ~/.local/share/dns53/install.sh --uninstall`
+- 诊断：`bash ~/.local/share/dns53/check_dns.sh`
 
 ## 原理
 
@@ -117,7 +123,7 @@ export ANTHROPIC_MODEL=deepseek-v4-flash[1m]
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/claude-code-termux/main/install.sh) --uninstall
 # 如需删除配置: rm -rf ~/.claude
-# dns53/dns-bootstrap 为 codex/opencode 共用, 默认保留
+# dns53 独立组件为 codex/opencode 共用, 默认保留; 卸载: bash ~/.local/share/dns53/install.sh --uninstall
 ```
 
 ## 常见问题
