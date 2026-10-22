@@ -64,7 +64,7 @@ bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/c
 | 全量升级 | `pkg upgrade -y` 把软件包升到最新 |
 | 依赖安装 | `nodejs-lts` + `patchelf`；musl loader 缺失时从 Alpine 拉取；无 root 自动补 proot |
 | 证书 | 使用 Termux 原生 `$PREFIX/etc/tls/cert.pem` |
-| **DNS** | 安装独立的 `dns53` 组件到 `~/.local/share/dns53`（不属于任何 agent）；有 root：转发器 + `.bashrc` 常驻（自动跟随手机 DNS）；无 root：`dns-bootstrap.js` 实测校验 + proot 绑定 |
+| **DNS** | 安装独立的 `dns53` 组件到 `~/.local/share/dns53`（不属于任何 agent）；有 root：转发器 + `.bashrc` / `.zshrc` 常驻（自动跟随手机 DNS）；无 root：`dns-bootstrap.js` 实测校验 + proot 绑定 |
 | 清理残留 | 自动检测并移除第三方损坏的 `$PREFIX/bin/claude`（如 @xurxuo 包残留） |
 | 安装 Claude | `npm pack @anthropic-ai/claude-code-linux-arm64-musl` → patchelf 改 interpreter → 直跑验证 → 放入 `~/.local/claude-code/claude` |
 | 生成 wrapper | `~/.local/bin/claude`：启动前自动检查更新、注入证书、`unset LD_PRELOAD`、DNS 自选、`claude update` 手动升级 |
