@@ -482,28 +482,15 @@ cleanup_legacy() {
     fi
 }
 
-# ---------- patchelf 补丁 (两种实现) ----------
-# Termux 默认的 patchelf 是 0.19.2, 它会把某些大体积 musl 二进制改坏: 退出码
-# 是 0 (看起来成功), 但产物一跑就 SIGSEGV (opencode V2 / qoder 上都复现过)。
-# glibc 环境里的 patchelf 是 0.19.1, 实测产物能原生直跑。所以验证不过时,
-# 先换 glibc 版再试一次, 都不行才退到 proot-bind。
-GLIBC_PATCHELF="$PREFIX/glibc/bin/patchelf"
+# ---------- patchelf 补丁 ----------
+# 只改 interpreter, 不设 RPATH: musl + Android 下给 ELF 写 rpath 会让二进制
+# 一启动就 SIGSEGV (实测 exit 139; patchelf 0.19.2 与 glibc 版 0.19.1 行为
+# 一致, 与版本无关)。所以不需要、也不应该为此安装 glibc 版 patchelf (214MB)。
 
-# 确保 glibc 版 patchelf 可用; 首次安装需下载约 33MB、占用约 214MB 磁盘
-install_glibc_patchelf() {
-    if command -v grun >/dev/null 2>&1 && [ -x "$GLIBC_PATCHELF" ]; then
-        return 0
-    fi
-    info "安装 glibc 版 patchelf (0.19.1, 能正确处理该二进制)…"
-    info "提示: 需下载约 33MB、占用约 214MB 磁盘, 首次会慢一些"
-    pkg install -y patchelf-glibc glibc glibc-runner gcc-libs-glibc >/dev/null 2>&1 || true
-    command -v grun >/dev/null 2>&1 && [ -x "$GLIBC_PATCHELF" ]
-}
-
-# ---------- proot 绑定运行 (patchelf 靠不住时的兜底) ----------
-# Termux 的 patchelf 0.19.2 会把某些大体积 musl 二进制改坏 (打完补丁一跑就
-# SIGSEGV, opencode V2 上已复现)。此时二进制保持官方原样, 改由 proot 把
-# musl loader / 运行库绑到它原本要找的标准路径上 —— 完全不需要 patchelf。
+# ---------- proot 绑定运行 (直跑不可用时的兜底) ----------
+# 无 root 时 musl 二进制可能被 Android seccomp 拦截 (Bad system call), 或
+# patchelf 产物在个别设备上仍跑不起来。此时二进制保持官方原样, 由 proot 把
+# musl loader / 运行库绑到它原本要找的标准路径上。
 proot_bind_run() {
     local bin="$1"; shift
     local opts=(-b "${MUSL_LOADER:-$PREFIX/lib/ld-musl-aarch64.so.1}:/lib/ld-musl-aarch64.so.1")
@@ -564,27 +551,7 @@ install_claude() {
     fi
 
     if [ "$verify_ok" -ne 1 ]; then
-        # 0.19.2 不行 → 换 glibc 版 0.19.1 再试一次 (实测它能正确处理)
-        if install_glibc_patchelf; then
-            info "改用 glibc 版 patchelf ($(grun "$GLIBC_PATCHELF" --version 2>/dev/null | head -1)) 重打补丁…"
-            cp -f "$work/claude.orig" "$work/package/claude"
-            grun "$GLIBC_PATCHELF" --set-interpreter "$MUSL_LOADER" "$work/package/claude" 2>/dev/null || true
-            chmod +x "$work/package/claude"
-            if have_root; then
-                env -u LD_PRELOAD SSL_CERT_FILE="$CERT_FILE" "$work/package/claude" --version >/dev/null 2>&1 && verify_ok=1
-            elif command -v proot >/dev/null 2>&1; then
-                proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" \
-                    env -u LD_PRELOAD SSL_CERT_FILE="$CERT_FILE" \
-                    "$work/package/claude" --version >/dev/null 2>&1 && verify_ok=1
-            else
-                env -u LD_PRELOAD SSL_CERT_FILE="$CERT_FILE" "$work/package/claude" --version >/dev/null 2>&1 && verify_ok=1
-            fi
-            [ "$verify_ok" -eq 1 ] && ok "glibc 版 patchelf 补丁验证通过"
-        fi
-    fi
-
-    if [ "$verify_ok" -ne 1 ]; then
-        warn "两种 patchelf 都跑不起来 (0.19.2 会改坏大体积 musl 二进制)"
+        warn "直跑验证失败 (如无 root 被 seccomp 拦截, 或 DNS 不可用)"
         info "改用 proot 绑定运行库模式 (二进制保持官方原样, 由 proot 绑 musl loader)"
         if ! command -v proot >/dev/null 2>&1; then
             info "安装 proot…"
