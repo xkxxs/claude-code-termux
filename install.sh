@@ -54,6 +54,20 @@ info() { echo -e "${BLU}▸${NC} $*"; }
 warn() { echo -e "${YEL}⚠${NC} $*"; }
 fail() { echo -e "${RED}✗${NC} $*"; exit 1; }
 
+# ---------- root 判定 ----------
+# Android 上有 root 不等于装了 Termux 的 sudo 包: Magisk/KernelSU 只提供 su。
+# 只判断 `sudo -n` 会把「有 su、没 sudo」的设备误判成无 root。
+have_root() {
+    [ "$(id -u 2>/dev/null)" = "0" ] && return 0
+    command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null && return 0
+    if command -v su >/dev/null 2>&1; then
+        local u=""
+        u="$(timeout 5 su -c 'id -u' 2>/dev/null | tr -d '\r' | head -n 1)" || true
+        [ "$u" = "0" ] && return 0
+    fi
+    return 1
+}
+
 # ---------- 进度显示 ----------
 # 背景: npm pack / npm install 全程不显示进度, 300MB 的包会让用户以为卡死。
 # ① 下载: 先用 `npm view <spec> dist.tarball` 拿真实 URL —— 该命令跟随用户
@@ -350,7 +364,10 @@ install_dependencies() {
     command -v node >/dev/null || need+=(nodejs-lts)
     command -v npm >/dev/null || need+=(nodejs-lts)
     command -v patchelf >/dev/null || need+=(patchelf)
-    if command -v sudo >/dev/null 2>&1; then
+    if have_root; then
+        # 有 root 也装 proot: dns53 挂掉时用它绑 resolv.conf 兜底 DNS
+        command -v proot >/dev/null 2>&1 || need+=(proot)
+    elif command -v sudo >/dev/null 2>&1; then
         if ! sudo -n true 2>/dev/null; then
             need+=(proot)
         fi
@@ -361,9 +378,16 @@ install_dependencies() {
         info "安装依赖: ${need[*]}"
         pkg install -y "${need[@]}" || fail "依赖安装失败, 请先手动执行 pkg update && pkg upgrade"
     fi
-    # sudo 刚装完再验证一次; 仍无 root 则补 proot
-    if ! sudo -n true 2>/dev/null; then
-        command -v proot >/dev/null 2>&1 || { info "未检测到 root, 安装 proot 兜底…"; pkg install -y proot; }
+    # 重新探测 root: 有 root 但缺 proot 也要补 (DNS 兜底); 无 root 则必须 proot
+    command -v proot >/dev/null 2>&1 || {
+        if have_root; then
+            info "有 root 但缺少 proot, 安装 DNS 兜底…"
+        else
+            info "未检测到 root, 安装 proot 兜底…"
+        fi
+        pkg install -y proot
+    }
+    if ! have_root; then
         warn "未检测到 root: 将使用 proot 兜底方案 (性能略降)"
     fi
     install_musl_loader
@@ -389,7 +413,7 @@ DNS53_RAW_BASES=(
     "https://cdn.jsdelivr.net/gh/xkxxs/claude-code-termux@main/dns53"
     "https://raw.githubusercontent.com/xkxxs/claude-code-termux/main/dns53"
 )
-DNS53_FILES=(install.sh VERSION dns53.js dns-bootstrap.js dnsq.js check_dns.sh dns53-aaaa)
+DNS53_FILES=(install.sh VERSION root.sh dns53.js dns-bootstrap.js dnsq.js check_dns.sh dns53-aaaa)
 
 fetch_dns53_payload() {
     local dst="$1" base f all
@@ -529,7 +553,7 @@ install_claude() {
     info "验证新二进制 (直跑, 无 grun)…"
     # 无 root 时 musl 二进制被 Android seccomp 拦截 → Bad system call, 需走 proot
     local verify_ok=0
-    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    if have_root; then
         env -u LD_PRELOAD SSL_CERT_FILE="$CERT_FILE" "$work/package/claude" --version >/dev/null 2>&1 && verify_ok=1
     elif command -v proot >/dev/null 2>&1; then
         proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" \
@@ -546,7 +570,7 @@ install_claude() {
             cp -f "$work/claude.orig" "$work/package/claude"
             grun "$GLIBC_PATCHELF" --set-interpreter "$MUSL_LOADER" "$work/package/claude" 2>/dev/null || true
             chmod +x "$work/package/claude"
-            if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            if have_root; then
                 env -u LD_PRELOAD SSL_CERT_FILE="$CERT_FILE" "$work/package/claude" --version >/dev/null 2>&1 && verify_ok=1
             elif command -v proot >/dev/null 2>&1; then
                 proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" \
@@ -613,6 +637,41 @@ MODE_FILE="$HOME/.local/claude-code/.mode"   # native (patchelf) / proot-bind
 DNS53_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dns53"
 NPM_PKG="@anthropic-ai/claude-code-linux-arm64-musl"
 
+# root 判定/执行后端: 由 dns53 组件的 root.sh 统一处理 direct/sudo/su
+# (Android 上 Magisk/KernelSU 只提供 su, 不能只判断 Termux 的 sudo 包)
+DNS_DIR="$DNS53_DIR"
+if [ -f "$DNS53_DIR/root.sh" ]; then
+    . "$DNS53_DIR/root.sh"
+    dns53_load_root_mode 0 || true
+fi
+if declare -F dns53_have_root >/dev/null 2>&1; then
+    have_root() { dns53_have_root; }
+else
+    have_root() {
+        [ "$(id -u 2>/dev/null)" = "0" ] && return 0
+        command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null && return 0
+        if command -v su >/dev/null 2>&1; then
+            local u=""
+            u="$(timeout 5 su -c 'id -u' 2>/dev/null | tr -d '\r' | head -n 1)" || true
+            [ "$u" = "0" ] && return 0
+        fi
+        return 1
+    }
+    # root.sh 缺失时的最小兜底 (旧行为: 只认 sudo -n / 本身已是 root)
+    dns53_alive() {
+        local f="$DNS53_DIR/.alive" now mt
+        [ -f "$f" ] || return 1
+        now=$(date +%s)
+        mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+        [ $((now - mt)) -lt 90 ]
+    }
+    dns53_root_exec() {
+        if [ "$(id -u 2>/dev/null)" = "0" ]; then "$@"
+        elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then sudo -n "$@"
+        else return 1; fi
+    }
+fi
+
 export SSL_CERT_FILE="${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
 export DISABLE_AUTOUPDATER=1
 # 兜底: claude 的 shell 集成需要可执行的入口路径, 固定指向 wrapper
@@ -658,7 +717,7 @@ run_claude() {
     if [ "$(cat "$MODE_FILE" 2>/dev/null || echo native)" = "proot-bind" ] \
        && command -v proot >/dev/null 2>&1; then
         proot_bind_run "$bin" "$@"
-    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    elif have_root; then
         "$bin" "$@"
     elif command -v proot >/dev/null 2>&1; then
         proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$bin" "$@"
@@ -756,13 +815,29 @@ case "${1:-}" in
             exec proot "${BINDS[@]}" "$CLAUDE_BIN" "$@"
         fi
         # DNS: 与 codex-termux 相同策略
-        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-            if ! sudo -n pgrep -f "dns5[3].js" > /dev/null 2>&1 && [ -f "$DNS53_DIR/dns53.js" ]; then
-                mkdir -p "$DNS53_DIR/logs"
-                sudo -n nohup node "$DNS53_DIR/dns53.js" >> "$DNS53_DIR/logs/dns53.log" 2>&1 &
-                sleep 1
+        if have_root; then
+            # 有 root 但 dns53 没在跑: 先尽力拉起 (direct/sudo/su 均可);
+            # 起不来时 native 直跑会没有可用 DNS, 改走 proot + dns-bootstrap。
+            if ! dns53_alive; then
+                if [ -f "$DNS53_DIR/dns53.js" ]; then
+                    mkdir -p "$DNS53_DIR/logs"
+                    dns53_root_exec nohup node "$DNS53_DIR/dns53.js" >> "$DNS53_DIR/logs/dns53.log" 2>&1 &
+                    sleep 1
+                fi
             fi
-            exec "$CLAUDE_BIN" "$@"
+            if dns53_alive; then
+                exec "$CLAUDE_BIN" "$@"
+            elif command -v proot >/dev/null 2>&1; then
+                [ -f "${PREFIX}/etc/resolv.conf" ] || { echo "缺少 ${PREFIX}/etc/resolv.conf, 请重跑安装脚本" >&2; exit 1; }
+                if [ -f "$DNS53_DIR/dns-bootstrap.js" ]; then
+                    node "$DNS53_DIR/dns-bootstrap.js" \
+                        || echo "!! 网络 DNS 全部不可用 (UDP 53 被拦截?), 已用公共 DNS 兜底继续启动" >&2
+                fi
+                exec proot -b "${PREFIX}/etc/resolv.conf:/etc/resolv.conf" "$CLAUDE_BIN" "$@"
+            else
+                # 最后兜底: 有 root 但既无 dns53 也无 proot, 只能直跑
+                exec "$CLAUDE_BIN" "$@"
+            fi
         elif command -v proot >/dev/null 2>&1; then
             [ -f "${PREFIX}/etc/resolv.conf" ] || { echo "缺少 ${PREFIX}/etc/resolv.conf, 请重跑安装脚本" >&2; exit 1; }
             if [ -f "$DNS53_DIR/dns-bootstrap.js" ] && ! pgrep -f "dns-bootstrap[.]js.*daemon" > /dev/null 2>&1; then
