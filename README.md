@@ -115,7 +115,7 @@ Claude 的 musl 二进制和 codex/opencode 行为一致：读不到 `/etc/resol
 export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
 export ANTHROPIC_AUTH_TOKEN=sk-你的Key
 export ANTHROPIC_MODEL=deepseek-v4-flash[1m]
-# 持久化: 追加到 ~/.bashrc
+# 持久化: 追加到 ~/.bashrc（zsh 用户为 ~/.zshrc）
 ```
 
 ## 卸载

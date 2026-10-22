@@ -579,6 +579,26 @@ install_claude() {
     rm -rf "$work"
 }
 
+# ---------- PATH ----------
+# 默认 shell 是 zsh 时不会读 ~/.bashrc, 只写 .bashrc 等于没装进 PATH。
+# 按 $SHELL / 已安装的 zsh / 已有的 .zshrc 判断, 两个 rc 文件都幂等写入。
+ensure_path_rc() {
+    local rc
+    local -a rcs=("$HOME_DIR/.bashrc")
+    if [ "$(basename "${SHELL:-bash}")" = "zsh" ] \
+       || [ -f "$HOME_DIR/.zshrc" ] \
+       || command -v zsh >/dev/null 2>&1; then
+        rcs+=("$HOME_DIR/.zshrc")
+    fi
+    for rc in "${rcs[@]}"; do
+        [ -e "$rc" ] || : > "$rc"
+        if ! grep -q '\.local/bin' "$rc" 2>/dev/null; then
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
+            info "~/.local/bin 已加入 PATH ($rc)"
+        fi
+    done
+}
+
 # ---------- 启动 wrapper ----------
 write_wrapper() {
     mkdir -p "$HOME_DIR/.local/bin"
@@ -821,11 +841,8 @@ esac
 WRAPPER_EOF
     chmod +x "$WRAPPER_PATH"
 
-    # 确保 ~/.local/bin 在 PATH 中且优先
-    if ! grep -q '\.local/bin' "$HOME_DIR/.bashrc" 2>/dev/null; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME_DIR/.bashrc"
-        info "~/.local/bin 已加入 PATH (~/.bashrc)"
-    fi
+    # 确保 ~/.local/bin 在 PATH 中且优先 (bash + zsh)
+    ensure_path_rc
     ok "启动 wrapper 已生成: $WRAPPER_PATH"
 }
 
